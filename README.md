@@ -16,7 +16,7 @@
 
 1. 确保已安装[HACS](https://hacs.xyz/)
 2. 在HACS中添加自定义仓库：
-   - 仓库URL: `https://github.com/your-username/xiaozhi-ha`
+   - 仓库URL: `https://github.com/zhouruhui/xiaozhi-ha`
    - 类别: `集成`
 3. 在HACS中安装"XiaoZhi ESP32 语音助手"集成
 4. 重启Home Assistant
@@ -120,7 +120,7 @@ XiaoZhi集成使用WebSocket协议连接ESP32设备和Home Assistant，主要组
 
 - 如有问题，请在GitHub仓库中提出issue
 - 欢迎提交Pull Request改进此集成
-- 项目地址：https://github.com/your-username/xiaozhi-ha
+- 项目地址：https://github.com/zhouruhui/xiaozhi-ha
 
 ## 许可证
 

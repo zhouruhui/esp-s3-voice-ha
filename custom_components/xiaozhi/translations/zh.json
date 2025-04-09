@@ -1,0 +1,93 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "配置XiaoZhi ESP32语音助手",
+        "description": "设置XiaoZhi ESP32与Home Assistant的集成",
+        "data": {
+          "name": "名称",
+          "pipeline_id": "语音助手Pipeline",
+          "websocket_port": "WebSocket端口",
+          "websocket_path": "WebSocket路径",
+          "forward_url": "转发URL（可选）"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "连接失败",
+      "invalid_auth": "认证无效",
+      "unknown": "未知错误",
+      "pipeline_not_found": "找不到指定的语音助手Pipeline",
+      "pipeline_required": "必须选择一个语音助手Pipeline",
+      "port_unavailable": "指定的端口不可用"
+    },
+    "abort": {
+      "already_configured": "设备已经配置"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "XiaoZhi ESP32选项",
+        "description": "调整XiaoZhi ESP32集成的设置",
+        "data": {
+          "pipeline_id": "语音助手Pipeline",
+          "websocket_path": "WebSocket路径",
+          "forward_url": "转发URL（可选）"
+        }
+      }
+    },
+    "error": {
+      "pipeline_not_found": "找不到指定的语音助手Pipeline",
+      "pipeline_required": "必须选择一个语音助手Pipeline"
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "connection": {
+        "name": "连接状态"
+      }
+    }
+  },
+  "selector": {
+    "pipeline": {
+      "options": {
+        "default": "默认Pipeline"
+      }
+    }
+  },
+  "services": {
+    "send_tts": {
+      "name": "发送TTS消息",
+      "description": "向指定XiaoZhi ESP32设备发送文本到语音消息",
+      "fields": {
+        "device_id": {
+          "name": "设备ID",
+          "description": "XiaoZhi ESP32设备的唯一标识符"
+        },
+        "message": {
+          "name": "消息内容",
+          "description": "需要播放的文本内容"
+        }
+      }
+    },
+    "get_device_config": {
+      "name": "获取设备配置",
+      "description": "获取用于ESP32设备配置的信息",
+      "fields": {
+        "config_entry_id": {
+          "name": "配置条目ID",
+          "description": "XiaoZhi集成配置条目的ID"
+        },
+        "device_id": {
+          "name": "设备ID",
+          "description": "XiaoZhi ESP32设备的唯一标识符，如不提供将自动生成"
+        },
+        "fallback_url": {
+          "name": "备选URL",
+          "description": "如果无法确定Home Assistant外部URL，使用此URL作为备选"
+        }
+      }
+    }
+  }
+} 
