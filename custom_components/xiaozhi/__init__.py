@@ -15,16 +15,20 @@ from homeassistant.exceptions import HomeAssistantError
 from .const import (
     DOMAIN,
     PLATFORMS,
-    CONF_WEBSOCKET_PORT,
+    CONF_PORT,
     CONF_WEBSOCKET_PATH,
     CONF_PIPELINE_ID,
     CONF_FORWARD_URL,
+    CONF_PROXY_MODE,
     SERVICE_SEND_TTS,
-    SERVICE_GET_DEVICE_CONFIG,
+    SERVICE_GET_CONFIG,
     ATTR_DEVICE_ID,
     ATTR_MESSAGE,
     ATTR_CONFIG_ENTRY_ID,
     ATTR_FALLBACK_URL,
+    DATA_WEBSOCKET,
+    EVENT_DEVICE_CONNECTED,
+    EVENT_DEVICE_DISCONNECTED,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -59,25 +63,36 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         
         # 获取配置项
         pipeline_id = config.get(CONF_PIPELINE_ID)
-        websocket_port = config.get(CONF_WEBSOCKET_PORT)
+        port = config.get(CONF_PORT)
         websocket_path = config.get(CONF_WEBSOCKET_PATH)
         forward_url = config.get(CONF_FORWARD_URL)
+        proxy_mode = config.get(CONF_PROXY_MODE, False)
         
-        if not pipeline_id:
-            _LOGGER.error("未指定语音助手Pipeline")
+        # 检查配置
+        if not proxy_mode and not pipeline_id:
+            _LOGGER.error("非代理模式下需要指定语音助手Pipeline")
+            return False
+        
+        if proxy_mode and not forward_url:
+            _LOGGER.error("代理模式下需要指定转发URL")
             return False
             
-        # 检查语音助手Pipeline是否存在
-        try:
-            pipelines = await assist_pipeline.async_get_pipelines(hass)
-            pipeline_exists = any(p.id == pipeline_id for p in pipelines)
-            
-            if not pipeline_exists:
-                _LOGGER.error("指定的语音助手Pipeline不存在: %s", pipeline_id)
-                return False
-        except Exception as exc:
-            _LOGGER.error("检查Pipeline时出错: %s", exc)
-            return False
+        # 仅在非代理模式下检查Pipeline
+        if not proxy_mode:
+            try:
+                pipelines = await assist_pipeline.async_get_pipelines(hass)
+                pipeline_exists = any(p.id == pipeline_id for p in pipelines)
+                
+                if not pipeline_exists:
+                    _LOGGER.error("指定的语音助手Pipeline不存在: %s", pipeline_id)
+                    return False
+            except Exception as exc:
+                _LOGGER.error("检查Pipeline时出错: %s", exc)
+                # 在代理模式下继续执行，无需Pipeline
+                if not proxy_mode:
+                    return False
+        else:
+            _LOGGER.info("已启用代理模式，将转发请求到: %s", forward_url)
             
         # 初始化WebSocket服务
         try:
@@ -85,10 +100,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             
             websocket = XiaozhiWebSocket(
                 hass=hass, 
-                port=websocket_port, 
+                port=port, 
                 websocket_path=websocket_path,
                 pipeline_id=pipeline_id,
-                forward_url=forward_url
+                forward_url=forward_url,
+                proxy_mode=proxy_mode
             )
             
             await websocket.start()
@@ -98,11 +114,32 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         
         # 存储WebSocket实例以便后续使用
         hass.data[DOMAIN][entry.entry_id] = {
-            "websocket": websocket,
+            DATA_WEBSOCKET: websocket,
         }
         
         _LOGGER.info("XiaoZhi ESP32助手WebSocket服务已启动，监听端口 %s，路径 %s", 
-                    websocket_port, websocket_path)
+                    port, websocket_path)
+        
+        # 注册设备连接/断开连接事件处理
+        @callback
+        def on_device_connected(device_id: str) -> None:
+            """当设备连接时触发事件。"""
+            hass.bus.async_fire(
+                EVENT_DEVICE_CONNECTED,
+                {"device_id": device_id}
+            )
+            
+        @callback
+        def on_device_disconnected(device_id: str) -> None:
+            """当设备断开连接时触发事件。"""
+            hass.bus.async_fire(
+                EVENT_DEVICE_DISCONNECTED,
+                {"device_id": device_id}
+            )
+            
+        # 注册事件处理器到WebSocket服务
+        websocket.on_device_connected = on_device_connected
+        websocket.on_device_disconnected = on_device_disconnected
         
         # 注册服务
         hass.services.async_register(
@@ -114,7 +151,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         
         hass.services.async_register(
             DOMAIN,
-            SERVICE_GET_DEVICE_CONFIG,
+            SERVICE_GET_CONFIG,
             _get_device_config,
             schema=GET_DEVICE_CONFIG_SCHEMA,
         )
@@ -135,13 +172,13 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         
         # 停止WebSocket服务
         if entry.entry_id in hass.data[DOMAIN]:
-            websocket = hass.data[DOMAIN][entry.entry_id].get("websocket")
+            websocket = hass.data[DOMAIN][entry.entry_id].get(DATA_WEBSOCKET)
             if websocket:
                 await websocket.stop()
             
             # 移除服务和数据
             hass.services.async_remove(DOMAIN, SERVICE_SEND_TTS)
-            hass.services.async_remove(DOMAIN, SERVICE_GET_DEVICE_CONFIG)
+            hass.services.async_remove(DOMAIN, SERVICE_GET_CONFIG)
             hass.data[DOMAIN].pop(entry.entry_id)
         
         return unload_ok
@@ -162,8 +199,8 @@ async def _async_send_tts(hass: HomeAssistant, service_call: ServiceCall) -> Non
         # 查找WebSocket服务实例
         websocket = None
         for entry_data in hass.data[DOMAIN].values():
-            if "websocket" in entry_data:
-                websocket = entry_data["websocket"]
+            if DATA_WEBSOCKET in entry_data:
+                websocket = entry_data[DATA_WEBSOCKET]
                 break
         
         if not websocket:
@@ -187,7 +224,7 @@ async def _get_device_config(hass: HomeAssistant, service_call: ServiceCall) -> 
             return
         
         entry_data = hass.data[DOMAIN][config_entry_id]
-        websocket = entry_data.get("websocket")
+        websocket = entry_data.get(DATA_WEBSOCKET)
         
         if not websocket:
             _LOGGER.error("无法找到WebSocket服务实例")

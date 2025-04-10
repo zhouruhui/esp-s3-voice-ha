@@ -9,13 +9,20 @@ from homeassistant.components.binary_sensor import (
     BinarySensorEntity,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import STATE_ON, STATE_OFF
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_state_change_event
 
-from .const import DOMAIN, CONNECTED, DISCONNECTED
+from .const import (
+    DOMAIN, 
+    CONNECTED, 
+    DISCONNECTED, 
+    DEVICE_CLASS_CONNECTIVITY,
+    DATA_WEBSOCKET,
+    EVENT_DEVICE_CONNECTED,
+    EVENT_DEVICE_DISCONNECTED
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -31,7 +38,7 @@ async def async_setup_entry(
             _LOGGER.error("集成没有正确初始化")
             return
             
-        websocket = hass.data[DOMAIN][config_entry.entry_id].get("websocket")
+        websocket = hass.data[DOMAIN][config_entry.entry_id].get(DATA_WEBSOCKET)
         
         if not websocket:
             _LOGGER.error("找不到WebSocket服务实例")
@@ -40,14 +47,6 @@ async def async_setup_entry(
         # 添加设备连接状态传感器
         async_add_entities([XiaozhiConnectionSensor(hass, config_entry, websocket)])
         
-        @callback
-        def device_connected_callback(device_id: str) -> None:
-            """当新设备连接时添加对应的传感器。"""
-            # 这里可以添加其他设备特定的传感器
-            pass
-        
-        # 监听websocket中的设备连接事件
-        websocket.device_connected_callback = device_connected_callback
     except Exception as exc:
         _LOGGER.error("设置XiaoZhi ESP32 binary sensor时出错: %s", exc)
 
@@ -86,45 +85,38 @@ class XiaozhiConnectionSensor(BinarySensorEntity):
         # 默认状态为未连接
         self._attr_is_on = False
         
-        # 注册事件监听器
-        self._async_update_callback_listener = None
-        
     async def async_added_to_hass(self) -> None:
         """Register callbacks when entity is added."""
         try:
             await super().async_added_to_hass()
             
-            # 监听设备状态变化事件
+            # 监听设备连接事件
             @callback
-            def _async_update_callback(event) -> None:
-                """Handle device state changes."""
-                try:
-                    device_id = event.data.get("device_id")
-                    state = event.data.get("state")
-                    
-                    if state == CONNECTED:
-                        self._attr_is_on = True
-                        self.async_write_ha_state()
-                    elif state == DISCONNECTED:
-                        self._attr_is_on = False
-                        self.async_write_ha_state()
-                except Exception as exc:
-                    _LOGGER.error("更新设备状态时出错: %s", exc)
+            def device_connected(event) -> None:
+                """处理设备连接事件"""
+                self._attr_is_on = True
+                self.async_write_ha_state()
             
-            self.hass.bus.async_listen("xiaozhi_device_state_changed", _async_update_callback)
+            # 监听设备断开连接事件
+            @callback
+            def device_disconnected(event) -> None:
+                """处理设备断开连接事件"""
+                self._attr_is_on = False
+                self.async_write_ha_state()
             
-            # 初始化状态为已连接的设备列表
-            try:
-                connected_devices = [
-                    device_id for device_id, device in self.websocket.devices.items()
-                    if device.get("connected", False)
-                ]
+            # 注册事件监听器
+            self.async_on_remove(
+                self.hass.bus.async_listen(EVENT_DEVICE_CONNECTED, device_connected)
+            )
+            self.async_on_remove(
+                self.hass.bus.async_listen(EVENT_DEVICE_DISCONNECTED, device_disconnected)
+            )
+            
+            # 初始化状态：检查是否有已连接的设备
+            if hasattr(self.websocket, 'device_ids') and len(self.websocket.device_ids) > 0:
+                self._attr_is_on = True
+                self.async_write_ha_state()
                 
-                if connected_devices:
-                    self._attr_is_on = True
-                    self.async_write_ha_state()
-            except Exception as exc:
-                _LOGGER.error("初始化连接状态时出错: %s", exc)
         except Exception as exc:
             _LOGGER.error("添加传感器到hass时出错: %s", exc)
     
@@ -138,15 +130,15 @@ class XiaozhiConnectionSensor(BinarySensorEntity):
     def extra_state_attributes(self) -> Dict[str, Any]:
         """Return the state attributes."""
         try:
-            return {
-                "connected_devices": [
-                    device_id for device_id, device in self.websocket.devices.items()
-                    if device.get("connected", False)
-                ],
-                "total_connections": len(self.websocket.connections),
-                "websocket_port": self.websocket.port,
-                "websocket_path": self.websocket.websocket_path,
-            }
+            # 获取设备的连接信息
+            if hasattr(self.websocket, 'device_ids') and hasattr(self.websocket, 'connections'):
+                return {
+                    "connected_devices": list(self.websocket.device_ids),
+                    "total_connections": len(self.websocket.connections),
+                    "websocket_port": self.websocket.port,
+                    "websocket_path": self.websocket.websocket_path,
+                }
+            return {}
         except Exception as exc:
             _LOGGER.error("获取传感器属性时出错: %s", exc)
             return {

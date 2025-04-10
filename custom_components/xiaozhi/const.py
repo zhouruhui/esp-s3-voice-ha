@@ -1,22 +1,36 @@
-"""Constants for the XiaoZhi ESP32 integration."""
+"""XiaoZhi ESP32 语音助手集成的常量定义。"""
 from homeassistant.const import Platform
 
 DOMAIN = "xiaozhi"
 PLATFORMS = [Platform.BINARY_SENSOR]
 
-# 配置项
-CONF_WEBSOCKET_PORT = "websocket_port"
+# 配置常量
+CONF_NAME = "name"
+CONF_PORT = "port"
 CONF_WEBSOCKET_PATH = "websocket_path"
 CONF_PIPELINE_ID = "pipeline_id"
+CONF_PROXY_MODE = "proxy_mode"
 CONF_FORWARD_URL = "forward_url"
 
 # 默认值
-DEFAULT_WEBSOCKET_PORT = 8554
-DEFAULT_WEBSOCKET_PATH = "/xiaozhi"
+DEFAULT_PORT = 6789
+DEFAULT_WEBSOCKET_PATH = "/ws/xiaozhi"
 
-# 服务
+# 服务名称
 SERVICE_SEND_TTS = "send_tts"
-SERVICE_GET_DEVICE_CONFIG = "get_device_config"
+SERVICE_GET_CONFIG = "get_device_config"
+
+# 事件名称
+EVENT_VOICE_COMMAND = "xiaozhi_voice_command"
+EVENT_DEVICE_CONNECTED = "xiaozhi_device_connected"
+EVENT_DEVICE_DISCONNECTED = "xiaozhi_device_disconnected"
+
+# 数据存储键
+DATA_WEBSOCKET = "websocket"
+DATA_DEVICES = "devices"
+
+# 二进制传感器
+DEVICE_CLASS_CONNECTIVITY = "connectivity"
 
 # 属性
 ATTR_DEVICE_ID = "device_id"

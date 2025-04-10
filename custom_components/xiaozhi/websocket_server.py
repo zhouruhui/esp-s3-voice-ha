@@ -1,632 +1,334 @@
-"""WebSocket server for XiaoZhi ESP32 integration."""
+"""XiaoZhi ESP32 WebSocket服务。"""
 import asyncio
 import json
 import logging
-from typing import Any, Dict, Optional, Set
-import uuid
-
 import aiohttp
-from aiohttp import web, WSMsgType
+from typing import Any, Dict, List, Optional, Set, Callable
+
+import voluptuous as vol
+import websockets
+from websockets.exceptions import ConnectionClosed
+
 from homeassistant.components import assist_pipeline
-from homeassistant.components.assist_pipeline import Pipeline, PipelineEvent, PipelineEventType
-from homeassistant.components.http import HomeAssistantView
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
+from .const import (
+    WS_MSG_TYPE_HELLO,
+    WS_MSG_TYPE_RECOGNITION_RESULT,
+    WS_MSG_TYPE_TTS_START,
+    WS_MSG_TYPE_TTS_END,
+    WS_MSG_TYPE_ERROR,
+    ERR_INVALID_MESSAGE,
+    ERR_SERVER_ERROR
+)
+
 _LOGGER = logging.getLogger(__name__)
 
-MSG_TYPE_CONNECT = "connect"
-MSG_TYPE_DISCONNECT = "disconnect"
-MSG_TYPE_PING = "ping"
-MSG_TYPE_PONG = "pong"
-MSG_TYPE_COMMAND = "command"
-MSG_TYPE_TEXT = "text"
-MSG_TYPE_AUDIO = "audio"
-MSG_TYPE_ERROR = "error"
-MSG_TYPE_SPEECH_START = "speech_start"
-MSG_TYPE_SPEECH_END = "speech_end"
-MSG_TYPE_INTENT = "intent"
-MSG_TYPE_TTS = "tts"
-
-
 class XiaozhiWebSocket:
-    """WebSocket server for XiaoZhi ESP32 devices."""
+    """WebSocket服务器组件，处理与ESP32设备的通信。"""
 
     def __init__(
         self,
         hass: HomeAssistant,
         port: int,
         websocket_path: str,
-        pipeline_id: str,
-        forward_url: Optional[str] = None
+        pipeline_id: Optional[str] = None,
+        forward_url: Optional[str] = None,
+        proxy_mode: bool = False,
     ) -> None:
-        """Initialize the WebSocket server."""
+        """初始化WebSocket服务器。"""
         self.hass = hass
         self.port = port
-        self.websocket_path = websocket_path if websocket_path.startswith("/") else f"/{websocket_path}"
+        self.websocket_path = websocket_path
         self.pipeline_id = pipeline_id
         self.forward_url = forward_url
-        self.runner = None
-        self.site = None
-        self.app = web.Application()
-        self.connections: Dict[str, Dict[str, Any]] = {}
-        self.devices: Dict[str, Dict[str, Any]] = {}
-        self.loop = asyncio.get_event_loop()
-        self.active_pipelines: Dict[str, Dict[str, Any]] = {}
-        self.session = async_get_clientsession(hass)
-        # 用于外部注册回调
-        self.device_connected_callback = None
+        self.proxy_mode = proxy_mode
+        self.server = None
+        self.connections: Dict[str, Any] = {}
+        self.device_ids: Set[str] = set()
+        
+        # 回调函数
+        self.on_device_connected: Optional[Callable[[str], None]] = None
+        self.on_device_disconnected: Optional[Callable[[str], None]] = None
 
     async def start(self) -> None:
-        """Start the WebSocket server."""
+        """启动WebSocket服务器。"""
         try:
-            self.app.router.add_route("GET", self.websocket_path, self.websocket_handler)
-            
-            # 设置runner和site
-            self.runner = web.AppRunner(self.app)
-            await self.runner.setup()
-            self.site = web.TCPSite(self.runner, "0.0.0.0", self.port)
-            
-            try:
-                await self.site.start()
-                _LOGGER.info("XiaoZhi WebSocket server started on port %s", self.port)
-            except OSError as err:
-                _LOGGER.error("无法启动WebSocket服务器: %s", err)
-                self.runner = None
-                if "address already in use" in str(err).lower():
-                    _LOGGER.error("端口 %s 已被占用，请选择其他端口", self.port)
-                raise
+            self.server = await websockets.serve(
+                self.handle_connection, "0.0.0.0", self.port, ping_interval=30
+            )
+            _LOGGER.info(
+                "XiaoZhi WebSocket服务已启动, 监听 0.0.0.0:%s%s",
+                self.port,
+                self.websocket_path,
+            )
         except Exception as exc:
-            _LOGGER.error("启动WebSocket服务器时发生未知错误: %s", exc)
+            _LOGGER.error("启动WebSocket服务器时出错: %s", exc)
             raise
 
     async def stop(self) -> None:
-        """Stop the WebSocket server."""
-        try:
-            if self.site:
-                await self.site.stop()
-                self.site = None
-            
-            if self.runner:
-                await self.runner.cleanup()
-                self.runner = None
-            
-            # 关闭所有连接
-            for conn_id, conn_data in list(self.connections.items()):
-                ws = conn_data.get("websocket")
-                if ws and not ws.closed:
-                    await ws.close()
-            
-            self.connections = {}
-            self.devices = {}
-            
-            _LOGGER.info("XiaoZhi WebSocket服务器已停止")
-        except Exception as exc:
-            _LOGGER.error("停止WebSocket服务器时出错: %s", exc)
+        """停止WebSocket服务器。"""
+        if self.server:
+            self.server.close()
+            await self.server.wait_closed()
+            self.server = None
+            _LOGGER.info("WebSocket服务器已停止")
 
-    async def websocket_handler(self, request: web.Request) -> web.WebSocketResponse:
-        """Handle WebSocket connections."""
+    async def handle_connection(self, websocket, path) -> None:
+        """处理新的WebSocket连接。"""
+        device_id = None
+        
+        if path != self.websocket_path:
+            _LOGGER.warning("收到无效路径的连接请求: %s", path)
+            await websocket.close(1008, "无效的WebSocket路径")
+            return
+
         try:
-            ws = web.WebSocketResponse()
-            await ws.prepare(request)
-            
-            conn_id = str(uuid.uuid4())
-            remote_ip = request.remote
-            
-            self.connections[conn_id] = {
-                "websocket": ws,
-                "remote_ip": remote_ip,
-                "device_id": None,
-                "last_activity": self.hass.loop.time(),
-            }
-            
-            _LOGGER.info("新WebSocket连接: %s (IP: %s)", conn_id, remote_ip)
-            
+            # 等待初始连接消息，以获取设备ID
+            initial_message = await websocket.recv()
             try:
-                async for msg in ws:
-                    if msg.type == WSMsgType.TEXT:
-                        await self._handle_text_message(conn_id, msg.data)
-                    elif msg.type == WSMsgType.BINARY:
-                        await self._handle_binary_message(conn_id, msg.data)
-                    elif msg.type == WSMsgType.ERROR:
-                        _LOGGER.error("WebSocket连接错误: %s", ws.exception())
-                        break
-            except asyncio.CancelledError:
-                _LOGGER.info("WebSocket连接被取消: %s", conn_id)
+                data = json.loads(initial_message)
+                device_id = data.get("device_id")
+
+                if not device_id:
+                    _LOGGER.warning("收到没有设备ID的连接消息: %s", initial_message)
+                    await websocket.close(1008, "缺少设备ID")
+                    return
+
+                _LOGGER.info("设备 %s 已连接", device_id)
+
+                # 存储连接和设备信息
+                self.connections[device_id] = websocket
+                self.device_ids.add(device_id)
+
+                # 通知连接成功
+                response = {"type": "connection", "status": "connected"}
+                await websocket.send(json.dumps(response))
+
+                # 触发设备连接回调
+                if self.on_device_connected:
+                    self.on_device_connected(device_id)
+
+                # 开始处理消息
+                await self._handle_messages(device_id, websocket)
+            except json.JSONDecodeError:
+                _LOGGER.warning("收到无效的JSON消息: %s", initial_message)
+                await websocket.close(1008, "无效的JSON格式")
             except Exception as exc:
-                _LOGGER.error("处理WebSocket消息时出错: %s", exc)
-            finally:
-                if conn_id in self.connections:
-                    try:
-                        device_id = self.connections[conn_id].get("device_id")
-                        if device_id and device_id in self.devices:
-                            self.devices[device_id]["connected"] = False
-                            # 通知设备状态变化
-                            self.hass.bus.async_fire(
-                                "xiaozhi_device_state_changed",
-                                {"device_id": device_id, "state": "disconnected"}
-                            )
-                        del self.connections[conn_id]
-                        
-                        _LOGGER.info("WebSocket连接已关闭: %s", conn_id)
-                    except Exception as exc:
-                        _LOGGER.error("清理连接时出错: %s", exc)
-            
-            return ws
+                _LOGGER.error("处理连接消息时出错: %s", exc)
+                await websocket.close(1011, "服务器内部错误")
+        except ConnectionClosed:
+            pass
         except Exception as exc:
-            _LOGGER.error("WebSocket处理程序出错: %s", exc)
-            raise web.HTTPInternalServerError()
+            _LOGGER.error("处理WebSocket连接时出错: %s", exc)
+        finally:
+            await self._cleanup_connection(device_id)
 
-    async def _handle_text_message(self, conn_id: str, message: str) -> None:
-        """Handle text messages from the client."""
-        if conn_id not in self.connections:
-            _LOGGER.warning("收到来自未知连接的消息: %s", conn_id)
-            return
-        
-        try:
-            data = json.loads(message)
-            msg_type = data.get("type")
+    async def _cleanup_connection(self, device_id: Optional[str]) -> None:
+        """清理断开的连接。"""
+        if device_id:
+            if device_id in self.connections:
+                del self.connections[device_id]
+            if device_id in self.device_ids:
+                self.device_ids.remove(device_id)
             
-            if not msg_type:
-                _LOGGER.warning("收到无类型的消息: %s", message)
-                return
-            
-            # 更新最后活动时间
-            self.connections[conn_id]["last_activity"] = self.hass.loop.time()
-            
-            if msg_type == MSG_TYPE_CONNECT:
-                await self._handle_connect(conn_id, data)
-            elif msg_type == MSG_TYPE_PING:
-                await self._send_text_response(conn_id, {"type": MSG_TYPE_PONG})
-            elif msg_type == MSG_TYPE_TEXT:
-                await self._handle_text_command(conn_id, data)
-            elif msg_type == MSG_TYPE_COMMAND:
-                await self._handle_command(conn_id, data)
-            elif msg_type == MSG_TYPE_SPEECH_END:
-                await self._handle_speech_end(conn_id, data)
-            else:
-                _LOGGER.warning("未知消息类型: %s", msg_type)
+            # 触发设备断开连接回调
+            if self.on_device_disconnected:
+                self.on_device_disconnected(device_id)
                 
-                # 如果设置了转发URL，转发消息
-                if self.forward_url:
-                    await self._forward_message(conn_id, data)
+            _LOGGER.info("设备 %s 已断开连接", device_id)
+
+    async def _handle_messages(self, device_id: str, websocket) -> None:
+        """处理来自设备的WebSocket消息。"""
+        try:
+            async for message in websocket:
+                try:
+                    data = json.loads(message)
+                    message_type = data.get("type", "unknown")
+
+                    _LOGGER.debug("收到来自设备 %s 的消息: %s", device_id, message_type)
+
+                    # 根据消息类型处理
+                    if message_type == "voice":
+                        await self._handle_voice_message(device_id, data, websocket)
+                    elif message_type == "ping":
+                        await websocket.send(json.dumps({"type": "pong"}))
+                    else:
+                        _LOGGER.warning("未知消息类型: %s", message_type)
+
+                except json.JSONDecodeError:
+                    _LOGGER.warning("收到无效的JSON消息: %s", message)
+                except Exception as exc:
+                    _LOGGER.error("处理消息时出错: %s", exc)
+        except ConnectionClosed:
+            _LOGGER.info("设备 %s 的连接已关闭", device_id)
+        except Exception as exc:
+            _LOGGER.error("_handle_messages 出错: %s", exc)
+
+    async def _handle_voice_message(self, device_id: str, data: Dict, websocket) -> None:
+        """处理语音消息。"""
+        try:
+            audio_format = data.get("format", "wav")
+            audio_data = data.get("data")
+            language = data.get("language", "zh-CN")
+            
+            if not audio_data:
+                _LOGGER.warning("语音消息中没有音频数据")
+                await websocket.send(json.dumps({
+                    "type": WS_MSG_TYPE_ERROR,
+                    "error": ERR_INVALID_MESSAGE,
+                    "message": "缺少音频数据"
+                }))
+                return
                 
-        except json.JSONDecodeError:
-            _LOGGER.warning("无效的JSON消息: %s", message)
-        except Exception as e:
-            _LOGGER.error("处理文本消息时出错: %s", e)
-    
-    async def _handle_binary_message(self, conn_id: str, data: bytes) -> None:
-        """Handle binary messages (audio data) from the client."""
-        if conn_id not in self.connections:
-            _LOGGER.warning("收到来自未知连接的音频数据: %s", conn_id)
-            return
-        
-        try:
-            device_id = self.connections[conn_id].get("device_id")
-            if not device_id:
-                _LOGGER.warning("收到未注册设备的音频数据")
+            # 代理模式 - 转发到外部服务
+            if self.proxy_mode and self.forward_url:
+                await self._forward_voice_request(device_id, data, websocket)
+                return
+                
+            # 本地处理模式 - 使用Home Assistant语音助手
+            if not self.pipeline_id:
+                _LOGGER.error("未配置语音助手Pipeline")
+                await websocket.send(json.dumps({
+                    "type": WS_MSG_TYPE_ERROR,
+                    "error": "missing_pipeline",
+                    "message": "未配置语音助手Pipeline"
+                }))
                 return
             
-            # 更新最后活动时间
-            self.connections[conn_id]["last_activity"] = self.hass.loop.time()
+            _LOGGER.debug("正在处理来自设备 %s 的语音请求", device_id)
             
-            # 检查是否有活动的语音管道
-            if conn_id not in self.active_pipelines:
-                # 创建新的语音识别管道
-                try:
-                    pipeline_id = self.pipeline_id
-                    pipeline = await assist_pipeline.async_get_pipeline(self.hass, pipeline_id)
-                    
-                    if not pipeline:
-                        _LOGGER.error("无法获取语音助手Pipeline: %s", pipeline_id)
-                        await self._send_text_response(conn_id, {
-                            "type": MSG_TYPE_ERROR, 
-                            "error": "找不到语音助手Pipeline"
-                        })
-                        return
-                    
-                    conversation_id = f"xiaozhi_{device_id}_{uuid.uuid4().hex[:8]}"
-                    
-                    pipeline_events = []
-                    audio_buffer = bytearray()
-                    
-                    self.active_pipelines[conn_id] = {
-                        "pipeline": pipeline,
-                        "conversation_id": conversation_id,
-                        "events": pipeline_events,
-                        "audio_buffer": audio_buffer,
-                        "stt_done": False,
-                        "intent_done": False,
-                    }
-                    
-                    # 开始执行语音助手Pipeline
-                    pipeline_runner = await pipeline.async_run(
-                        conversation_id=conversation_id,
-                        device_id=device_id,
-                        start_stage="stt",
-                        end_stage="tts",
-                        event_callback=lambda event: self._pipeline_event_callback(conn_id, event),
-                    )
-                    
-                    self.active_pipelines[conn_id]["runner"] = pipeline_runner
-                    
-                    # 通知客户端语音识别开始
-                    await self._send_text_response(conn_id, {"type": MSG_TYPE_SPEECH_START})
-                except Exception as exc:
-                    _LOGGER.error("初始化Pipeline时出错: %s", exc)
-                    await self._send_text_response(conn_id, {
-                        "type": MSG_TYPE_ERROR, 
-                        "error": f"初始化Pipeline失败: {exc}"
-                    })
-                    return
-            
-            # 将音频数据添加到活动的管道
-            if self.active_pipelines[conn_id].get("runner"):
-                try:
-                    runner = self.active_pipelines[conn_id]["runner"]
-                    await runner.stt_stream.async_put_audio_stream(data)
-                    
-                    # 如果设置了转发URL，转发音频数据
-                    if self.forward_url:
-                        await self._forward_audio(conn_id, data)
-                except Exception as exc:
-                    _LOGGER.error("处理音频数据时出错: %s", exc)
-                    # 清理管道资源
-                    self._cleanup_pipeline(conn_id)
-        except Exception as exc:
-            _LOGGER.error("处理二进制消息时出错: %s", exc)
-
-    async def _handle_connect(self, conn_id: str, data: Dict[str, Any]) -> None:
-        """Handle device connection."""
-        try:
-            device_id = data.get("device_id")
-            if not device_id:
-                await self._send_text_response(conn_id, {
-                    "type": MSG_TYPE_ERROR, 
-                    "error": "缺少device_id"
-                })
-                return
-            
-            # 更新连接信息
-            self.connections[conn_id]["device_id"] = device_id
-            
-            # 更新设备状态
-            self.devices[device_id] = {
-                "conn_id": conn_id,
-                "connected": True,
-                "last_seen": self.hass.loop.time(),
-            }
-            
-            # 通知设备状态变化
-            self.hass.bus.async_fire(
-                "xiaozhi_device_state_changed",
-                {"device_id": device_id, "state": "connected"}
-            )
-            
-            await self._send_text_response(conn_id, {
-                "type": MSG_TYPE_CONNECT,
-                "status": "connected",
-                "server_id": "home_assistant"
-            })
-            
-            _LOGGER.info("设备已连接: %s (连接ID: %s)", device_id, conn_id)
-            
-            # 调用连接回调
-            if self.device_connected_callback:
-                try:
-                    self.device_connected_callback(device_id)
-                except Exception as exc:
-                    _LOGGER.error("设备连接回调出错: %s", exc)
-        except Exception as exc:
-            _LOGGER.error("处理连接请求时出错: %s", exc)
-
-    async def _handle_text_command(self, conn_id: str, data: Dict[str, Any]) -> None:
-        """Handle text command from device."""
-        try:
-            device_id = self.connections[conn_id].get("device_id")
-            if not device_id:
-                _LOGGER.warning("收到未注册设备的文本命令")
-                return
-            
-            text = data.get("text", "")
-            if not text:
-                return
-            
-            _LOGGER.debug("收到文本命令: %s", text)
-            
-            # 使用对话Pipeline处理文本命令
             try:
-                pipeline_id = self.pipeline_id
-                pipeline = await assist_pipeline.async_get_pipeline(self.hass, pipeline_id)
+                # 使用语音助手处理语音请求
+                pipeline_input = {
+                    "audio": audio_data,
+                    "language": language,
+                }
                 
-                if not pipeline:
-                    _LOGGER.error("无法获取语音助手Pipeline: %s", pipeline_id)
-                    await self._send_text_response(conn_id, {
-                        "type": MSG_TYPE_ERROR, 
-                        "error": "找不到语音助手Pipeline"
-                    })
-                    return
+                _LOGGER.debug("提交语音处理请求到Pipeline: %s", self.pipeline_id)
                 
-                conversation_id = f"xiaozhi_text_{device_id}_{uuid.uuid4().hex[:8]}"
-                
-                # 直接从文本开始处理
-                result = await pipeline.async_run(
-                    text=text,
-                    conversation_id=conversation_id,
-                    device_id=device_id,
-                    start_stage="intent",
-                    end_stage="tts",
+                # 提交请求到语音助手Pipeline
+                result = await assist_pipeline.async_pipeline_from_audio(
+                    self.hass,
+                    bytes.fromhex(audio_data),
+                    pipeline_id=self.pipeline_id,
+                    language=language,
                 )
                 
-                # 处理结果
-                if result:
-                    if result.intent_response:
-                        await self._send_text_response(conn_id, {
-                            "type": MSG_TYPE_INTENT,
-                            "intent": result.intent_response.response.speech.plain.text,
-                        })
-                    
-                    if result.tts_output and result.tts_output.get("audio"):
-                        # 发送TTS音频数据
-                        ws = self.connections[conn_id].get("websocket")
-                        if ws and not ws.closed:
-                            await ws.send_bytes(result.tts_output["audio"])
+                # 检查处理结果
+                if not result or not result.response:
+                    _LOGGER.warning("语音助手没有返回响应")
+                    await websocket.send(json.dumps({
+                        "type": WS_MSG_TYPE_ERROR,
+                        "error": "no_response",
+                        "message": "语音助手没有返回响应"
+                    }))
+                    return
+                
+                # 返回处理结果
+                _LOGGER.debug("语音处理返回: %s", result.response)
+                
+                await websocket.send(json.dumps({
+                    "type": WS_MSG_TYPE_RECOGNITION_RESULT,
+                    "text": result.response,
+                    "status": "success"
+                }))
+                
             except Exception as exc:
-                _LOGGER.error("处理文本命令时出错: %s", exc)
-                await self._send_text_response(conn_id, {
-                    "type": MSG_TYPE_ERROR, 
-                    "error": f"处理文本命令失败: {exc}"
-                })
+                _LOGGER.error("语音处理请求出错: %s", exc)
+                await websocket.send(json.dumps({
+                    "type": WS_MSG_TYPE_ERROR,
+                    "error": "processing_error",
+                    "message": f"语音处理错误: {str(exc)}"
+                }))
         except Exception as exc:
-            _LOGGER.error("处理文本命令时出错: %s", exc)
-
-    async def _handle_command(self, conn_id: str, data: Dict[str, Any]) -> None:
-        """Handle command from device."""
+            _LOGGER.error("处理语音消息时出错: %s", exc)
+            
+    async def _forward_voice_request(self, device_id: str, data: Dict, websocket) -> None:
+        """转发语音请求到外部服务"""
         try:
-            device_id = self.connections[conn_id].get("device_id")
-            if not device_id:
-                _LOGGER.warning("收到未注册设备的命令")
-                return
+            _LOGGER.debug("转发来自设备 %s 的语音请求到: %s", device_id, self.forward_url)
             
-            command = data.get("command")
-            if not command:
-                return
+            # 创建会话
+            session = async_get_clientsession(self.hass)
             
-            # 处理特定命令
-            if command == "stop_listening":
-                # 停止当前活动的语音管道
-                if conn_id in self.active_pipelines:
-                    try:
-                        runner = self.active_pipelines[conn_id].get("runner")
-                        if runner:
-                            await runner.stop()
-                        del self.active_pipelines[conn_id]
-                    except Exception as exc:
-                        _LOGGER.error("停止监听时出错: %s", exc)
-                
-                await self._send_text_response(conn_id, {
-                    "type": MSG_TYPE_COMMAND,
-                    "command": "stop_listening",
-                    "status": "ok"
-                })
-            elif command == "get_status":
-                # 发送状态信息
-                await self._send_text_response(conn_id, {
-                    "type": MSG_TYPE_COMMAND,
-                    "command": "status",
-                    "status": "ok",
-                    "server_id": "home_assistant",
-                    "device_id": device_id
-                })
-            else:
-                # 如果设置了转发URL，转发命令
-                if self.forward_url:
-                    await self._forward_message(conn_id, data)
-                else:
-                    _LOGGER.warning("未知命令: %s", command)
-        except Exception as exc:
-            _LOGGER.error("处理命令时出错: %s", exc)
-
-    async def _handle_speech_end(self, conn_id: str, data: Dict[str, Any]) -> None:
-        """Handle speech end notification."""
-        try:
-            if conn_id not in self.active_pipelines:
-                return
+            # 准备请求数据
+            request_data = {
+                "type": "voice",
+                "device_id": device_id,
+                "data": data.get("data"),
+                "format": data.get("format", "wav"),
+                "language": data.get("language", "zh-CN")
+            }
             
-            # 通知语音管道音频流结束
-            runner = self.active_pipelines[conn_id].get("runner")
-            if runner:
+            # 发送请求到转发URL
+            async with session.post(
+                self.forward_url, 
+                json=request_data,
+                timeout=10
+            ) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    _LOGGER.error(
+                        "转发请求失败，状态码: %s, 错误: %s", 
+                        response.status, error_text
+                    )
+                    await websocket.send(json.dumps({
+                        "type": WS_MSG_TYPE_ERROR,
+                        "error": "forward_failed",
+                        "message": f"转发请求失败: {response.status}"
+                    }))
+                    return
+                    
+                # 解析响应
                 try:
-                    await runner.stt_stream.async_end_stream()
-                    self.active_pipelines[conn_id]["stt_done"] = True
+                    response_data = await response.json()
+                    _LOGGER.debug("转发服务返回: %s", response_data)
+                    
+                    # 转发响应回设备
+                    await websocket.send(json.dumps({
+                        "type": WS_MSG_TYPE_RECOGNITION_RESULT,
+                        "text": response_data.get("text", ""),
+                        "status": "success"
+                    }))
                 except Exception as exc:
-                    _LOGGER.error("结束语音流时出错: %s", exc)
-                    # 强制清理管道
-                    self._cleanup_pipeline(conn_id)
+                    _LOGGER.error("解析转发响应时出错: %s", exc)
+                    await websocket.send(json.dumps({
+                        "type": WS_MSG_TYPE_ERROR,
+                        "error": "invalid_response",
+                        "message": "无法解析服务器响应"
+                    }))
+        except asyncio.TimeoutError:
+            _LOGGER.error("转发请求超时")
+            await websocket.send(json.dumps({
+                "type": WS_MSG_TYPE_ERROR,
+                "error": "timeout",
+                "message": "转发请求超时"
+            }))
         except Exception as exc:
-            _LOGGER.error("处理语音结束通知时出错: %s", exc)
-
-    async def _pipeline_event_callback(self, conn_id: str, event: PipelineEvent) -> None:
-        """Handle events from the pipeline."""
-        try:
-            if conn_id not in self.active_pipelines:
-                return
-            
-            # 存储事件
-            self.active_pipelines[conn_id]["events"].append(event)
-            
-            if event.type == PipelineEventType.STT_END:
-                self.active_pipelines[conn_id]["stt_done"] = True
-                text = event.data.get("stt_output", {}).get("text")
-                
-                if text:
-                    await self._send_text_response(conn_id, {
-                        "type": MSG_TYPE_TEXT,
-                        "text": text,
-                    })
-            
-            elif event.type == PipelineEventType.INTENT_END:
-                self.active_pipelines[conn_id]["intent_done"] = True
-                intent_response = event.data.get("intent_response")
-                
-                if intent_response and hasattr(intent_response, "response") and hasattr(intent_response.response, "speech"):
-                    speech_text = intent_response.response.speech.plain.text
-                    await self._send_text_response(conn_id, {
-                        "type": MSG_TYPE_INTENT,
-                        "intent": speech_text,
-                    })
-            
-            elif event.type == PipelineEventType.TTS_END:
-                # TTS处理完成
-                tts_output = event.data.get("tts_output")
-                if tts_output and tts_output.get("audio"):
-                    # 发送TTS音频数据
-                    ws = self.connections[conn_id].get("websocket")
-                    if ws and not ws.closed:
-                        await ws.send_bytes(tts_output["audio"])
-                
-                # 清理管道资源
-                self._cleanup_pipeline(conn_id)
-            
-            elif event.type == PipelineEventType.RUN_END:
-                # 清理管道资源
-                self._cleanup_pipeline(conn_id)
-            
-            elif event.type == PipelineEventType.ERROR:
-                # 发生错误
-                error_info = event.data.get("error", "未知错误")
-                _LOGGER.error("Pipeline执行错误: %s", error_info)
-                await self._send_text_response(conn_id, {
-                    "type": MSG_TYPE_ERROR,
-                    "error": f"Pipeline错误: {error_info}"
-                })
-                # 清理管道资源
-                self._cleanup_pipeline(conn_id)
-        except Exception as exc:
-            _LOGGER.error("Pipeline事件回调处理时出错: %s", exc)
-            # 清理资源，防止资源泄漏
-            self._cleanup_pipeline(conn_id)
-
-    def _cleanup_pipeline(self, conn_id: str) -> None:
-        """Clean up pipeline resources."""
-        try:
-            if conn_id in self.active_pipelines:
-                runner = self.active_pipelines[conn_id].get("runner")
-                if runner:
-                    asyncio.create_task(runner.stop())
-                del self.active_pipelines[conn_id]
-        except Exception as exc:
-            _LOGGER.error("清理Pipeline资源时出错: %s", exc)
-
-    async def _send_text_response(self, conn_id: str, response: Dict[str, Any]) -> None:
-        """Send text response to the client."""
-        try:
-            if conn_id not in self.connections:
-                return
-            
-            ws = self.connections[conn_id].get("websocket")
-            if ws and not ws.closed:
-                try:
-                    await ws.send_str(json.dumps(response))
-                except Exception as e:
-                    _LOGGER.error("发送响应时出错: %s", e)
-        except Exception as exc:
-            _LOGGER.error("发送文本响应时出错: %s", exc)
+            _LOGGER.error("转发语音请求时出错: %s", exc)
+            await websocket.send(json.dumps({
+                "type": WS_MSG_TYPE_ERROR,
+                "error": ERR_SERVER_ERROR,
+                "message": f"转发请求错误: {str(exc)}"
+            }))
 
     async def send_tts_message(self, device_id: str, message: str) -> None:
-        """Send TTS message to a device."""
+        """发送TTS消息到设备。"""
         try:
-            # 查找设备连接
-            conn_id = None
-            for device_id_key, device_data in self.devices.items():
-                if device_id_key == device_id and device_data.get("connected"):
-                    conn_id = device_data.get("conn_id")
-                    break
-            
-            if not conn_id:
-                _LOGGER.warning("找不到连接的设备: %s", device_id)
+            if device_id not in self.connections:
+                _LOGGER.warning("设备 %s 未连接，无法发送TTS消息", device_id)
                 return
-            
-            # 使用Pipeline生成TTS
-            try:
-                pipeline_id = self.pipeline_id
-                pipeline = await assist_pipeline.async_get_pipeline(self.hass, pipeline_id)
-                
-                if not pipeline:
-                    _LOGGER.error("无法获取语音助手Pipeline: %s", pipeline_id)
-                    return
-                
-                # 直接执行TTS
-                result = await pipeline.async_run(
-                    text=message,
-                    conversation_id=f"xiaozhi_tts_{device_id}_{uuid.uuid4().hex[:8]}",
-                    device_id=device_id,
-                    start_stage="tts",
-                    end_stage="tts",
-                )
-                
-                if result and result.tts_output and result.tts_output.get("audio"):
-                    # 发送TTS音频数据
-                    ws = self.connections[conn_id].get("websocket")
-                    if ws and not ws.closed:
-                        # 首先发送TTS开始通知
-                        await self._send_text_response(conn_id, {
-                            "type": MSG_TYPE_TTS, 
-                            "status": "start"
-                        })
-                        
-                        # 发送音频数据
-                        await ws.send_bytes(result.tts_output["audio"])
-                        
-                        # 发送TTS结束通知
-                        await self._send_text_response(conn_id, {
-                            "type": MSG_TYPE_TTS, 
-                            "status": "end"
-                        })
-                    else:
-                        _LOGGER.warning("设备WebSocket连接已关闭")
-                else:
-                    _LOGGER.error("生成TTS音频失败")
-            except Exception as exc:
-                _LOGGER.error("处理TTS请求时出错: %s", exc)
+
+            websocket = self.connections[device_id]
+            await websocket.send(
+                json.dumps({"type": WS_MSG_TYPE_TTS_START, "message": message})
+            )
+            _LOGGER.debug("已发送TTS消息到设备 %s: %s", device_id, message)
         except Exception as exc:
             _LOGGER.error("发送TTS消息时出错: %s", exc)
 
-    async def _forward_message(self, conn_id: str, data: Dict[str, Any]) -> None:
-        """Forward message to external service."""
-        if not self.forward_url:
-            return
-        
-        try:
-            async with self.session.post(
-                self.forward_url, 
-                json=data, 
-                headers={"Content-Type": "application/json"}
-            ) as resp:
-                if resp.status != 200:
-                    _LOGGER.warning("转发消息失败: %s", await resp.text())
-                    return
-                
-                # 处理响应
-                response_data = await resp.json()
-                await self._send_text_response(conn_id, response_data)
-        except Exception as e:
-            _LOGGER.error("转发消息时出错: %s", e)
-
-    async def _forward_audio(self, conn_id: str, audio_data: bytes) -> None:
-        """Forward audio data to external service."""
-        if not self.forward_url:
-            return
-        
-        try:
-            audio_forward_url = f"{self.forward_url}/audio"
-            async with self.session.post(
-                audio_forward_url, 
-                data=audio_data, 
-                headers={"Content-Type": "audio/raw"}
-            ) as resp:
-                if resp.status != 200:
-                    _LOGGER.warning("转发音频失败: %s", await resp.text())
-        except Exception as e:
-            _LOGGER.error("转发音频时出错: %s", e) 
+    def get_connected_devices(self) -> List[str]:
+        """获取已连接设备列表。"""
+        return list(self.device_ids) 
