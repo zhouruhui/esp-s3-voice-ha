@@ -156,8 +156,7 @@ class XiaozhiWebSocket:
                     # 发送符合小智规范的hello响应
                     response = {
                         "type": "hello",
-                        "result": "success",
-                        "session_id": "",  # WebSocket不需要session_id
+                        "result": "success"
                     }
                     _LOGGER.debug("发送hello响应: %s", json.dumps(response))
                     await websocket.send(json.dumps(response))
