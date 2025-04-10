@@ -61,15 +61,26 @@ class XiaozhiWebSocket:
             websockets_version = getattr(websockets, "__version__", "unknown")
             _LOGGER.info("使用websockets库版本: %s", websockets_version)
             
-            # 根据不同版本使用不同的API
+            # 适配不同版本的websockets库
             if websockets_version.startswith("10.") or websockets_version.startswith("11."):
                 # 10.x, 11.x 版本API
                 self.server = await websockets.serve(
                     self.handle_connection, "0.0.0.0", self.port, ping_interval=30
                 )
-            else:
-                # 较新版本API (可能需要更多参数)
+            elif hasattr(websockets, "server") and hasattr(websockets.server, "serve"):
+                # 如果确实有server子模块
                 self.server = await websockets.server.serve(
+                    self.handle_connection, "0.0.0.0", self.port, ping_interval=30
+                )
+            elif hasattr(websockets, "Server"):
+                # 15.x 版本使用Server类
+                from websockets.server import serve
+                self.server = await serve(
+                    self.handle_connection, "0.0.0.0", self.port, ping_interval=30
+                )
+            else:
+                # 其他版本尝试直接调用
+                self.server = await websockets.serve(
                     self.handle_connection, "0.0.0.0", self.port, ping_interval=30
                 )
                 
