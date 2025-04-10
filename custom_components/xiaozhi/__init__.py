@@ -15,7 +15,7 @@ from homeassistant.exceptions import HomeAssistantError
 from .const import (
     DOMAIN,
     PLATFORMS,
-    CONF_PORT,
+    CONF_WEBSOCKET_PORT,
     CONF_WEBSOCKET_PATH,
     CONF_PIPELINE_ID,
     CONF_FORWARD_URL,
@@ -63,7 +63,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         
         # 获取配置项
         pipeline_id = config.get(CONF_PIPELINE_ID)
-        port = config.get(CONF_PORT)
+        port = config.get(CONF_WEBSOCKET_PORT)
         websocket_path = config.get(CONF_WEBSOCKET_PATH)
         forward_url = config.get(CONF_FORWARD_URL)
         proxy_mode = config.get(CONF_PROXY_MODE, False)
