@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 import aiohttp
+import traceback
 from typing import Any, Dict, List, Optional, Set, Callable
 
 import voluptuous as vol
@@ -55,9 +56,23 @@ class XiaozhiWebSocket:
     async def start(self) -> None:
         """启动WebSocket服务器。"""
         try:
-            self.server = await websockets.serve(
-                self.handle_connection, "0.0.0.0", self.port, ping_interval=30
-            )
+            import websockets
+            # 检查websockets库版本
+            websockets_version = getattr(websockets, "__version__", "unknown")
+            _LOGGER.info("使用websockets库版本: %s", websockets_version)
+            
+            # 根据不同版本使用不同的API
+            if websockets_version.startswith("10.") or websockets_version.startswith("11."):
+                # 10.x, 11.x 版本API
+                self.server = await websockets.serve(
+                    self.handle_connection, "0.0.0.0", self.port, ping_interval=30
+                )
+            else:
+                # 较新版本API (可能需要更多参数)
+                self.server = await websockets.server.serve(
+                    self.handle_connection, "0.0.0.0", self.port, ping_interval=30
+                )
+                
             _LOGGER.info(
                 "XiaoZhi WebSocket服务已启动, 监听 0.0.0.0:%s%s",
                 self.port,
@@ -65,6 +80,7 @@ class XiaozhiWebSocket:
             )
         except Exception as exc:
             _LOGGER.error("启动WebSocket服务器时出错: %s", exc)
+            traceback.print_exc()
             raise
 
     async def stop(self) -> None:
@@ -75,9 +91,12 @@ class XiaozhiWebSocket:
             self.server = None
             _LOGGER.info("WebSocket服务器已停止")
 
-    async def handle_connection(self, websocket, path) -> None:
+    async def handle_connection(self, websocket) -> None:
         """处理新的WebSocket连接。"""
         device_id = None
+        
+        # 获取path从websocket对象
+        path = websocket.path
         
         if path != self.websocket_path:
             _LOGGER.warning("收到无效路径的连接请求: %s", path)
@@ -85,43 +104,74 @@ class XiaozhiWebSocket:
             return
 
         try:
-            # 等待初始连接消息，以获取设备ID
+            # 从headers获取设备信息
+            headers = websocket.request_headers
+            _LOGGER.debug("收到连接请求 headers: %s", headers)
+            
+            # 尝试从header获取设备ID (符合小智规范)
+            device_id = headers.get("Device-Id")
+            auth_token = headers.get("Authorization")
+            protocol_version = headers.get("Protocol-Version")
+            client_id = headers.get("Client-Id")
+            
+            _LOGGER.debug("连接信息: device_id=%s, protocol=%s, client=%s", 
+                         device_id, protocol_version, client_id)
+            
+            # 等待hello消息
             initial_message = await websocket.recv()
+            _LOGGER.debug("收到初始消息: %s", initial_message)
+            
             try:
                 data = json.loads(initial_message)
-                device_id = data.get("device_id")
+                message_type = data.get("type")
+                
+                # 如果是hello消息，则处理
+                if message_type == "hello":
+                    # 如果header中没有设备ID，尝试从消息中获取
+                    if not device_id:
+                        device_id = data.get("device_id")
+                    
+                    if not device_id:
+                        _LOGGER.warning("无法获取设备ID")
+                        await websocket.close(1008, "缺少设备ID")
+                        return
 
-                if not device_id:
-                    _LOGGER.warning("收到没有设备ID的连接消息: %s", initial_message)
-                    await websocket.close(1008, "缺少设备ID")
-                    return
+                    _LOGGER.info("设备 %s 已连接", device_id)
 
-                _LOGGER.info("设备 %s 已连接", device_id)
+                    # 存储连接和设备信息
+                    self.connections[device_id] = websocket
+                    self.device_ids.add(device_id)
 
-                # 存储连接和设备信息
-                self.connections[device_id] = websocket
-                self.device_ids.add(device_id)
+                    # 发送符合小智规范的hello响应
+                    response = {
+                        "type": "hello",
+                        "result": "success",
+                        "session_id": "",  # WebSocket不需要session_id
+                    }
+                    _LOGGER.debug("发送hello响应: %s", json.dumps(response))
+                    await websocket.send(json.dumps(response))
 
-                # 通知连接成功
-                response = {"type": "connection", "status": "connected"}
-                await websocket.send(json.dumps(response))
+                    # 触发设备连接回调
+                    if self.on_device_connected:
+                        self.on_device_connected(device_id)
 
-                # 触发设备连接回调
-                if self.on_device_connected:
-                    self.on_device_connected(device_id)
-
-                # 开始处理消息
-                await self._handle_messages(device_id, websocket)
+                    # 开始处理消息
+                    await self._handle_messages(device_id, websocket)
+                else:
+                    _LOGGER.warning("首条消息不是hello类型: %s", message_type)
+                    await websocket.close(1008, "期望hello消息")
             except json.JSONDecodeError:
                 _LOGGER.warning("收到无效的JSON消息: %s", initial_message)
                 await websocket.close(1008, "无效的JSON格式")
             except Exception as exc:
                 _LOGGER.error("处理连接消息时出错: %s", exc)
+                traceback.print_exc()  # 打印详细错误信息
                 await websocket.close(1011, "服务器内部错误")
         except ConnectionClosed:
-            pass
+            _LOGGER.info("连接被关闭")
         except Exception as exc:
             _LOGGER.error("处理WebSocket连接时出错: %s", exc)
+            traceback.print_exc()  # 打印详细错误信息
         finally:
             await self._cleanup_connection(device_id)
 
@@ -144,27 +194,46 @@ class XiaozhiWebSocket:
         try:
             async for message in websocket:
                 try:
-                    data = json.loads(message)
-                    message_type = data.get("type", "unknown")
-
-                    _LOGGER.debug("收到来自设备 %s 的消息: %s", device_id, message_type)
-
-                    # 根据消息类型处理
-                    if message_type == "voice":
-                        await self._handle_voice_message(device_id, data, websocket)
-                    elif message_type == "ping":
-                        await websocket.send(json.dumps({"type": "pong"}))
+                    # 判断是文本消息还是二进制消息
+                    if isinstance(message, str):
+                        # 处理文本消息
+                        data = json.loads(message)
+                        message_type = data.get("type", "unknown")
+                        _LOGGER.debug("收到来自设备 %s 的文本消息: %s", device_id, message_type)
+                        
+                        # 根据消息类型处理
+                        if message_type == "start_listen":
+                            # 开始监听处理
+                            await self._handle_start_listen(device_id, data)
+                        elif message_type == "stop_listen":
+                            # 停止监听处理
+                            await self._handle_stop_listen(device_id, data)
+                        elif message_type == "wakeword_detected":
+                            # 唤醒词检测处理
+                            await self._handle_wakeword_detected(device_id, data)
+                        elif message_type == "abort":
+                            # 中止处理
+                            await self._handle_abort(device_id, data)
+                        elif message_type == "ping":
+                            # 心跳响应
+                            await websocket.send(json.dumps({"type": "pong"}))
+                        else:
+                            _LOGGER.warning("未识别的消息类型: %s", message_type)
                     else:
-                        _LOGGER.warning("未知消息类型: %s", message_type)
-
+                        # 处理二进制数据 (音频数据)
+                        _LOGGER.debug("收到来自设备 %s 的二进制数据，长度: %d", device_id, len(message))
+                        await self._handle_binary_message(device_id, message)
+                        
                 except json.JSONDecodeError:
-                    _LOGGER.warning("收到无效的JSON消息: %s", message)
+                    _LOGGER.warning("收到无效的JSON消息")
                 except Exception as exc:
                     _LOGGER.error("处理消息时出错: %s", exc)
+                    traceback.print_exc()
         except ConnectionClosed:
             _LOGGER.info("设备 %s 的连接已关闭", device_id)
         except Exception as exc:
             _LOGGER.error("_handle_messages 出错: %s", exc)
+            traceback.print_exc()
 
     async def _handle_voice_message(self, device_id: str, data: Dict, websocket) -> None:
         """处理语音消息。"""
@@ -246,72 +315,89 @@ class XiaozhiWebSocket:
             _LOGGER.error("处理语音消息时出错: %s", exc)
             
     async def _forward_voice_request(self, device_id: str, data: Dict, websocket) -> None:
-        """转发语音请求到外部服务"""
-        try:
-            _LOGGER.debug("转发来自设备 %s 的语音请求到: %s", device_id, self.forward_url)
-            
-            # 创建会话
-            session = async_get_clientsession(self.hass)
-            
-            # 准备请求数据
-            request_data = {
-                "type": "voice",
-                "device_id": device_id,
-                "data": data.get("data"),
-                "format": data.get("format", "wav"),
-                "language": data.get("language", "zh-CN")
-            }
-            
-            # 发送请求到转发URL
-            async with session.post(
-                self.forward_url, 
-                json=request_data,
-                timeout=10
-            ) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    _LOGGER.error(
-                        "转发请求失败，状态码: %s, 错误: %s", 
-                        response.status, error_text
-                    )
-                    await websocket.send(json.dumps({
-                        "type": WS_MSG_TYPE_ERROR,
-                        "error": "forward_failed",
-                        "message": f"转发请求失败: {response.status}"
-                    }))
-                    return
-                    
-                # 解析响应
-                try:
-                    response_data = await response.json()
-                    _LOGGER.debug("转发服务返回: %s", response_data)
-                    
-                    # 转发响应回设备
-                    await websocket.send(json.dumps({
-                        "type": WS_MSG_TYPE_RECOGNITION_RESULT,
-                        "text": response_data.get("text", ""),
-                        "status": "success"
-                    }))
-                except Exception as exc:
-                    _LOGGER.error("解析转发响应时出错: %s", exc)
-                    await websocket.send(json.dumps({
-                        "type": WS_MSG_TYPE_ERROR,
-                        "error": "invalid_response",
-                        "message": "无法解析服务器响应"
-                    }))
-        except asyncio.TimeoutError:
-            _LOGGER.error("转发请求超时")
+        """转发语音请求到外部服务。"""
+        if not self.forward_url:
+            _LOGGER.error("未配置转发URL")
             await websocket.send(json.dumps({
                 "type": WS_MSG_TYPE_ERROR,
-                "error": "timeout",
-                "message": "转发请求超时"
+                "error": "missing_forward_url",
+                "message": "未配置转发URL"
             }))
-        except Exception as exc:
-            _LOGGER.error("转发语音请求时出错: %s", exc)
+            return
+            
+        try:
+            # 客户端会话
+            session = async_get_clientsession(self.hass)
+            
+            # 将Forward URL从ws开头转换为http开头用于aiohttp请求
+            http_url = self.forward_url.replace("ws://", "http://").replace("wss://", "https://")
+            
+            # 发送请求
+            _LOGGER.debug("转发请求到: %s", http_url)
+            
+            # 对于不同类型的消息使用不同的处理逻辑
+            message_type = data.get("type", "")
+            
+            if message_type == "voice":
+                # 处理语音识别请求
+                audio_data = data.get("data")
+                format_type = data.get("format", "opus")
+                
+                # 组装请求数据
+                payload = {
+                    "audio_data": audio_data,
+                    "format": format_type,
+                    "device_id": device_id
+                }
+                
+                async with session.post(f"{http_url}/recognize", json=payload) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        
+                        # 返回结果给设备
+                        response_message = {
+                            "type": WS_MSG_TYPE_RECOGNITION_RESULT,
+                            "text": result.get("text", ""),
+                            "is_final": True
+                        }
+                        await websocket.send(json.dumps(response_message))
+                    else:
+                        error_text = await response.text()
+                        _LOGGER.error("转发请求失败: %s - %s", response.status, error_text)
+                        await websocket.send(json.dumps({
+                            "type": WS_MSG_TYPE_ERROR,
+                            "error": ERR_SERVER_ERROR,
+                            "message": f"转发服务返回错误: {response.status}"
+                        }))
+            else:
+                # 其他类型的请求转发
+                async with session.post(f"{http_url}/forward", json=data) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        await websocket.send(json.dumps(result))
+                    else:
+                        error_text = await response.text()
+                        _LOGGER.error("转发请求失败: %s - %s", response.status, error_text)
+                        await websocket.send(json.dumps({
+                            "type": WS_MSG_TYPE_ERROR,
+                            "error": ERR_SERVER_ERROR,
+                            "message": f"转发服务返回错误: {response.status}"
+                        }))
+                        
+        except aiohttp.ClientError as exc:
+            _LOGGER.error("HTTP请求错误: %s", exc)
             await websocket.send(json.dumps({
                 "type": WS_MSG_TYPE_ERROR,
                 "error": ERR_SERVER_ERROR,
-                "message": f"转发请求错误: {str(exc)}"
+                "message": f"HTTP请求错误: {str(exc)}"
+            }))
+        except Exception as exc:
+            _LOGGER.error("转发请求时出错: %s", exc)
+            traceback.print_exc()
+            await websocket.send(json.dumps({
+                "type": WS_MSG_TYPE_ERROR,
+                "error": ERR_SERVER_ERROR,
+                "message": f"转发请求时出错: {str(exc)}"
             }))
 
     async def send_tts_message(self, device_id: str, message: str) -> None:
@@ -331,4 +417,64 @@ class XiaozhiWebSocket:
 
     def get_connected_devices(self) -> List[str]:
         """获取已连接设备列表。"""
-        return list(self.device_ids) 
+        return list(self.device_ids)
+
+    async def _handle_start_listen(self, device_id: str, data: Dict) -> None:
+        """处理开始监听消息。"""
+        _LOGGER.debug("处理开始监听消息: %s", data)
+        # 在这里可以添加开始监听的逻辑
+        # 如果是代理模式，可以将消息转发到外部服务
+        
+    async def _handle_stop_listen(self, device_id: str, data: Dict) -> None:
+        """处理停止监听消息。"""
+        _LOGGER.debug("处理停止监听消息: %s", data)
+        # 在这里可以添加停止监听的逻辑
+        
+    async def _handle_wakeword_detected(self, device_id: str, data: Dict) -> None:
+        """处理唤醒词检测消息。"""
+        _LOGGER.debug("处理唤醒词检测消息: %s", data)
+        # 可以触发Home Assistant事件或启动语音处理流程
+        
+    async def _handle_abort(self, device_id: str, data: Dict) -> None:
+        """处理中止消息。"""
+        _LOGGER.debug("处理中止消息: %s", data)
+        # 中止当前正在进行的处理
+        
+    async def _handle_binary_message(self, device_id: str, data: bytes) -> None:
+        """处理二进制音频数据。"""
+        _LOGGER.debug("收到来自设备 %s 的二进制数据，长度: %d字节", device_id, len(data))
+        
+        # 判断是否为代理模式
+        if self.proxy_mode and self.forward_url:
+            # 代理模式下，转发到外部服务
+            await self._forward_binary_data(device_id, data)
+        else:
+            # 本地处理模式，使用语音助手Pipeline
+            await self._process_audio_locally(device_id, data)
+    
+    async def _forward_binary_data(self, device_id: str, data: bytes) -> None:
+        """转发二进制数据到外部服务。"""
+        if not self.forward_url:
+            _LOGGER.error("未配置转发URL")
+            return
+            
+        try:
+            # 在这里实现转发逻辑
+            _LOGGER.debug("转发二进制数据到: %s", self.forward_url)
+            # 实际的转发实现...
+        except Exception as exc:
+            _LOGGER.error("转发二进制数据时出错: %s", exc)
+    
+    async def _process_audio_locally(self, device_id: str, audio_data: bytes) -> None:
+        """本地处理音频数据。"""
+        try:
+            if not self.pipeline_id:
+                _LOGGER.error("未配置语音助手Pipeline")
+                return
+                
+            # 调用Home Assistant的语音助手Pipeline处理音频
+            # 实际实现...
+            _LOGGER.debug("使用Pipeline %s 处理音频数据", self.pipeline_id)
+        except Exception as exc:
+            _LOGGER.error("本地处理音频数据时出错: %s", exc)
+            traceback.print_exc() 

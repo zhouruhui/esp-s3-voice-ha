@@ -90,11 +90,22 @@ async def validate_input(hass: HomeAssistant, data: dict) -> dict:
 async def _async_get_pipelines(hass: HomeAssistant) -> Dict[str, str]:
     """获取可用的语音助手Pipeline。"""
     try:
-        pipelines = await assist_pipeline.async_get_pipelines(hass)
-        return {pipeline.id: pipeline.name for pipeline in pipelines}
+        # 不使用await，直接获取列表
+        pipeline_list = assist_pipeline.async_get_pipelines(hass)
+        
+        if not pipeline_list:
+            _LOGGER.warning("未找到语音助手Pipeline")
+            # 添加一个默认选项，避免UI为空
+            return {"default": "默认Pipeline"}
+        
+        # 转换为字典格式
+        pipelines = {pipeline.id: pipeline.name for pipeline in pipeline_list}
+        return pipelines
     except Exception as e:
         _LOGGER.error("获取语音助手Pipeline时出错: %s", e)
-        return {}
+        _LOGGER.exception("详细错误:")
+        # 返回默认值避免UI出错
+        return {"default": "默认Pipeline"}
 
 class XiaozhiConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for XiaoZhi ESP32."""
