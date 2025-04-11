@@ -579,67 +579,84 @@ class XiaozhiWebSocket:
             if not (ws_url.startswith("ws://") or ws_url.startswith("wss://")):
                 ws_url = f"ws://{ws_url}"
             
-            _LOGGER.debug("尝试WebSocket连接到: %s", ws_url)
+            # 将device_id作为URL参数传递，而不是作为header
+            device_id_param = f"device_id={device_id}"
+            if "?" in ws_url:
+                ws_url = f"{ws_url}&{device_id_param}"
+            else:
+                ws_url = f"{ws_url}?{device_id_param}"
+                
+            _LOGGER.debug("尝试通过URL连接到: %s", ws_url)
             
-            # 构建连接头信息
-            headers = {
-                "Device-Id": device_id
-            }
+            # 获取websockets库版本
+            websockets_version = getattr(websockets, "__version__", "unknown")
+            _LOGGER.debug("当前使用websockets库版本: %s", websockets_version)
             
-            # 使用异步上下文管理器建立WebSocket连接
-            async with websockets.connect(ws_url, extra_headers=headers) as ws_client:
-                # 发送hello消息
-                hello_msg = {
-                    "type": "hello",
-                    "device_id": device_id,
-                    "audio_params": {
-                        "sample_rate": 16000,
-                        "format": "opus",
-                        "channels": 1
+            try:
+                # 尝试使用纯净版本，不传递任何自定义头
+                async with websockets.connect(ws_url) as ws_client:
+                    # 发送hello消息
+                    hello_msg = {
+                        "type": "hello",
+                        "device_id": device_id,
+                        "audio_params": {
+                            "sample_rate": 16000,
+                            "format": "opus",
+                            "channels": 1
+                        }
                     }
-                }
-                await ws_client.send(json.dumps(hello_msg))
-                
-                # 等待hello响应
-                response = await ws_client.recv()
-                _LOGGER.debug("收到hello响应: %s", response)
-                
-                # 发送二进制音频数据
-                await ws_client.send(data)
-                
-                # 等待识别结果
-                try:
-                    result_data = await asyncio.wait_for(ws_client.recv(), timeout=10.0)
-                    if isinstance(result_data, str):
-                        # 解析JSON响应
-                        result = json.loads(result_data)
+                    
+                    _LOGGER.debug("发送hello消息: %s", json.dumps(hello_msg))
+                    await ws_client.send(json.dumps(hello_msg))
+                    
+                    # 等待hello响应
+                    response = await ws_client.recv()
+                    _LOGGER.debug("收到hello响应: %s", response)
+                    
+                    # 发送二进制音频数据
+                    _LOGGER.debug("发送二进制音频数据，长度: %d字节", len(data))
+                    await ws_client.send(data)
+                    
+                    # 等待识别结果
+                    try:
+                        result_data = await asyncio.wait_for(ws_client.recv(), timeout=10.0)
+                        _LOGGER.debug("收到WebSocket响应: %s", 
+                                    result_data if isinstance(result_data, str) else f"二进制数据({len(result_data)}字节)")
                         
-                        # 获取连接的WebSocket
+                        if isinstance(result_data, str):
+                            # 解析JSON响应
+                            result = json.loads(result_data)
+                            
+                            # 获取连接的WebSocket
+                            websocket = self.connections.get(device_id)
+                            if websocket:
+                                # 转发识别结果
+                                if "type" in result and result["type"] == "recognition_result":
+                                    await websocket.send(json.dumps({
+                                        "type": WS_MSG_TYPE_RECOGNITION_RESULT,
+                                        "text": result.get("text", ""),
+                                        "status": "success"
+                                    }))
+                                else:
+                                    # 直接转发未知类型的响应
+                                    await websocket.send(result_data)
+                            else:
+                                _LOGGER.warning("无法发送识别结果，设备可能已断开连接")
+                        else:
+                            _LOGGER.warning("收到非文本响应: %s", type(result_data))
+                    except asyncio.TimeoutError:
+                        _LOGGER.error("等待识别结果超时")
                         websocket = self.connections.get(device_id)
                         if websocket:
-                            # 转发识别结果
-                            if "type" in result and result["type"] == "recognition_result":
-                                await websocket.send(json.dumps({
-                                    "type": WS_MSG_TYPE_RECOGNITION_RESULT,
-                                    "text": result.get("text", ""),
-                                    "status": "success"
-                                }))
-                            else:
-                                # 直接转发未知类型的响应
-                                await websocket.send(result_data)
-                        else:
-                            _LOGGER.warning("无法发送识别结果，设备可能已断开连接")
-                    else:
-                        _LOGGER.warning("收到非文本响应: %s", type(result_data))
-                except asyncio.TimeoutError:
-                    _LOGGER.error("等待识别结果超时")
-                    websocket = self.connections.get(device_id)
-                    if websocket:
-                        await websocket.send(json.dumps({
-                            "type": WS_MSG_TYPE_ERROR,
-                            "error": "timeout",
-                            "message": "语音识别超时"
-                        }))
+                            await websocket.send(json.dumps({
+                                "type": WS_MSG_TYPE_ERROR,
+                                "error": "timeout",
+                                "message": "语音识别超时"
+                            }))
+            except Exception as inner_exc:
+                _LOGGER.error("WebSocket连接错误 (无headers): %s", inner_exc)
+                raise  # 重新抛出异常，以便尝试备用方法
+                
         except websockets.exceptions.WebSocketException as exc:
             _LOGGER.error("WebSocket连接错误: %s", exc)
             traceback.print_exc()
