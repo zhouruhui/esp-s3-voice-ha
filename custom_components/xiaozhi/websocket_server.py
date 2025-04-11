@@ -571,49 +571,80 @@ class XiaozhiWebSocket:
             return
             
         try:
-            # 获取客户端会话
-            session = async_get_clientsession(self.hass)
+            # 使用websockets库建立WebSocket连接
+            import websockets
             
-            # 将Forward URL从ws开头转换为http开头用于aiohttp请求
-            http_url = self.forward_url.replace("ws://", "http://").replace("wss://", "https://")
+            # 确保URL是WebSocket格式
+            ws_url = self.forward_url
+            if not (ws_url.startswith("ws://") or ws_url.startswith("wss://")):
+                ws_url = f"ws://{ws_url}"
             
-            # 构建请求数据
+            _LOGGER.debug("尝试WebSocket连接到: %s", ws_url)
+            
+            # 构建连接头信息
             headers = {
-                "Content-Type": "application/octet-stream",
                 "Device-Id": device_id
             }
             
-            # 发送二进制数据到外部服务
-            _LOGGER.debug("转发二进制数据到: %s/audio", http_url)
-            
-            # 使用POST请求发送二进制数据
-            async with session.post(
-                f"{http_url}/audio", 
-                data=data,
-                headers=headers
-            ) as response:
-                if response.status == 200:
-                    # 如果响应成功，获取结果并发送给设备
-                    try:
-                        result = await response.json()
+            # 使用异步上下文管理器建立WebSocket连接
+            async with websockets.connect(ws_url, extra_headers=headers) as ws_client:
+                # 发送hello消息
+                hello_msg = {
+                    "type": "hello",
+                    "device_id": device_id,
+                    "audio_params": {
+                        "sample_rate": 16000,
+                        "format": "opus",
+                        "channels": 1
+                    }
+                }
+                await ws_client.send(json.dumps(hello_msg))
+                
+                # 等待hello响应
+                response = await ws_client.recv()
+                _LOGGER.debug("收到hello响应: %s", response)
+                
+                # 发送二进制音频数据
+                await ws_client.send(data)
+                
+                # 等待识别结果
+                try:
+                    result_data = await asyncio.wait_for(ws_client.recv(), timeout=10.0)
+                    if isinstance(result_data, str):
+                        # 解析JSON响应
+                        result = json.loads(result_data)
+                        
                         # 获取连接的WebSocket
                         websocket = self.connections.get(device_id)
-                        if websocket and "text" in result:
-                            # 返回识别结果
-                            await websocket.send(json.dumps({
-                                "type": WS_MSG_TYPE_RECOGNITION_RESULT,
-                                "text": result.get("text", ""),
-                                "status": "success"
-                            }))
+                        if websocket:
+                            # 转发识别结果
+                            if "type" in result and result["type"] == "recognition_result":
+                                await websocket.send(json.dumps({
+                                    "type": WS_MSG_TYPE_RECOGNITION_RESULT,
+                                    "text": result.get("text", ""),
+                                    "status": "success"
+                                }))
+                            else:
+                                # 直接转发未知类型的响应
+                                await websocket.send(result_data)
                         else:
                             _LOGGER.warning("无法发送识别结果，设备可能已断开连接")
-                    except Exception as exc:
-                        _LOGGER.error("处理音频响应出错: %s", exc)
-                else:
-                    error_text = await response.text()
-                    _LOGGER.error("转发音频数据失败: %s - %s", response.status, error_text)
-        except aiohttp.ClientError as exc:
-            _LOGGER.error("HTTP请求错误: %s", exc)
+                    else:
+                        _LOGGER.warning("收到非文本响应: %s", type(result_data))
+                except asyncio.TimeoutError:
+                    _LOGGER.error("等待识别结果超时")
+                    websocket = self.connections.get(device_id)
+                    if websocket:
+                        await websocket.send(json.dumps({
+                            "type": WS_MSG_TYPE_ERROR,
+                            "error": "timeout",
+                            "message": "语音识别超时"
+                        }))
+        except websockets.exceptions.WebSocketException as exc:
+            _LOGGER.error("WebSocket连接错误: %s", exc)
+            traceback.print_exc()
+        except json.JSONDecodeError as exc:
+            _LOGGER.error("JSON解析错误: %s", exc)
         except Exception as exc:
             _LOGGER.error("转发二进制数据时出错: %s", exc)
             traceback.print_exc()
