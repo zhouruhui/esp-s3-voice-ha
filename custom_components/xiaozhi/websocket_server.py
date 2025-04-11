@@ -153,10 +153,10 @@ class XiaozhiWebSocket:
                     self.connections[device_id] = websocket
                     self.device_ids.add(device_id)
 
-                    # 发送符合小智规范的hello响应
+                    # 发送符合小智规范的hello响应 - 关键修改：完全符合小智协议
                     response = {
                         "type": "hello",
-                        "result": "success"
+                        "status": "ok"
                     }
                     _LOGGER.debug("发送hello响应: %s", json.dumps(response))
                     await websocket.send(json.dumps(response))
@@ -221,6 +221,12 @@ class XiaozhiWebSocket:
                         elif message_type == "wakeword_detected":
                             # 唤醒词检测处理
                             await self._handle_wakeword_detected(device_id, data)
+                        elif message_type == "auth": 
+                            # 处理认证消息 - 小智协议使用auth类型消息
+                            await self._handle_auth_message(device_id, data, websocket)
+                        elif message_type == "voice":
+                            # 处理语音消息
+                            await self._handle_voice_message(device_id, data, websocket)
                         elif message_type == "abort":
                             # 中止处理
                             await self._handle_abort(device_id, data)
@@ -418,12 +424,28 @@ class XiaozhiWebSocket:
                 return
 
             websocket = self.connections[device_id]
+            
+            # 首先发送TTS开始消息
             await websocket.send(
-                json.dumps({"type": WS_MSG_TYPE_TTS_START, "message": message})
+                json.dumps({
+                    "type": "tts", 
+                    "state": "sentence_start", 
+                    "message": message
+                })
             )
+            
+            # 假设TTS处理完成，发送结束消息
+            await websocket.send(
+                json.dumps({
+                    "type": "tts", 
+                    "state": "sentence_end"
+                })
+            )
+            
             _LOGGER.debug("已发送TTS消息到设备 %s: %s", device_id, message)
         except Exception as exc:
             _LOGGER.error("发送TTS消息时出错: %s", exc)
+            traceback.print_exc()
 
     def get_connected_devices(self) -> List[str]:
         """获取已连接设备列表。"""
@@ -459,8 +481,22 @@ class XiaozhiWebSocket:
             # 代理模式下，转发到外部服务
             await self._forward_binary_data(device_id, data)
         else:
-            # 本地处理模式，使用语音助手Pipeline
-            await self._process_audio_locally(device_id, data)
+            # 本地处理模式，将二进制数据转换为语音命令
+            websocket = self.connections.get(device_id)
+            if not websocket:
+                _LOGGER.error("设备 %s 未连接，无法处理音频数据", device_id)
+                return
+                
+            # 构造一个模拟的语音消息
+            voice_message = {
+                "type": "voice",
+                "data": data.hex(),  # 将二进制数据转为hex字符串
+                "format": "opus",    # XiaoZhi使用OPUS编码
+                "language": "zh-CN"
+            }
+            
+            # 处理语音消息
+            await self._handle_voice_message(device_id, voice_message, websocket)
     
     async def _forward_binary_data(self, device_id: str, data: bytes) -> None:
         """转发二进制数据到外部服务。"""
@@ -487,4 +523,39 @@ class XiaozhiWebSocket:
             _LOGGER.debug("使用Pipeline %s 处理音频数据", self.pipeline_id)
         except Exception as exc:
             _LOGGER.error("本地处理音频数据时出错: %s", exc)
-            traceback.print_exc() 
+            traceback.print_exc()
+
+    async def _handle_auth_message(self, device_id: str, data: Dict, websocket) -> None:
+        """处理auth认证消息。"""
+        try:
+            # 从消息中获取device-id
+            device_id_from_msg = data.get("device-id")
+            
+            if device_id_from_msg and device_id_from_msg != device_id:
+                # 如果消息中的device-id与连接保存的不同，更新device_id
+                _LOGGER.info("设备ID已更新: %s -> %s", device_id, device_id_from_msg)
+                
+                # 更新连接信息
+                if device_id in self.connections:
+                    del self.connections[device_id]
+                if device_id in self.device_ids:
+                    self.device_ids.remove(device_id)
+                
+                device_id = device_id_from_msg
+                self.connections[device_id] = websocket
+                self.device_ids.add(device_id)
+            
+            # 返回认证成功响应
+            await websocket.send(json.dumps({
+                "type": "auth",
+                "status": "ok"
+            }))
+            
+            _LOGGER.debug("设备 %s 认证成功", device_id)
+        except Exception as exc:
+            _LOGGER.error("处理认证消息时出错: %s", exc)
+            await websocket.send(json.dumps({
+                "type": "auth", 
+                "status": "error",
+                "message": f"认证处理错误: {str(exc)}"
+            })) 
