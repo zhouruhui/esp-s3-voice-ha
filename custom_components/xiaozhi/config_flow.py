@@ -13,10 +13,6 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.data_entry_flow import FlowResult
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.selector import (
-    BooleanSelector,
-    NumberSelector,
-    NumberSelectorConfig,
-    NumberSelectorMode,
     TextSelector,
     TextSelectorConfig,
     TextSelectorType,
@@ -27,10 +23,8 @@ from .const import (
     CONF_WEBSOCKET_PORT,
     CONF_WEBSOCKET_PATH,
     CONF_PIPELINE_ID,
-    CONF_FORWARD_URL,
     DEFAULT_WEBSOCKET_PORT,
     DEFAULT_WEBSOCKET_PATH,
-    CONF_PROXY_MODE,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -55,31 +49,19 @@ async def validate_input(hass: HomeAssistant, data: dict) -> dict:
             errors["base"] = "port_unavailable"
             return errors
 
-        # 检查是否是代理模式
-        proxy_mode = data.get(CONF_PROXY_MODE, False)
+        # 检查Pipeline是否存在
+        pipeline_id = data.get(CONF_PIPELINE_ID)
+        if not pipeline_id:
+            errors["base"] = "pipeline_required"
+            return errors
         
-        # 在代理模式下，不要检查Pipeline
-        if not proxy_mode:
-            # 检查Pipeline是否存在
-            pipeline_id = data.get(CONF_PIPELINE_ID)
-            if not pipeline_id:
-                # 在非代理模式下，仍然需要Pipeline
-                errors["base"] = "pipeline_required"
-                return errors
-            
-            try:
-                pipelines = await assist_pipeline.async_get_pipelines(hass)
-                if not any(p.id == pipeline_id for p in pipelines):
-                    errors["base"] = "pipeline_not_found"
-            except Exception as ex:
-                _LOGGER.error("获取Pipeline失败: %s", ex)
-                errors["base"] = "unknown"
-        else:
-            # 代理模式下，检查转发URL
-            forward_url = data.get(CONF_FORWARD_URL)
-            if not forward_url:
-                errors["base"] = "forward_url_required"
-                return errors
+        try:
+            pipelines = await assist_pipeline.async_get_pipelines(hass)
+            if not any(p.id == pipeline_id for p in pipelines):
+                errors["base"] = "pipeline_not_found"
+        except Exception as ex:
+            _LOGGER.error("获取Pipeline失败: %s", ex)
+            errors["base"] = "unknown"
                 
     except Exception as ex:
         _LOGGER.error("验证输入时出错: %s", ex)
@@ -90,17 +72,17 @@ async def validate_input(hass: HomeAssistant, data: dict) -> dict:
 async def _async_get_pipelines(hass: HomeAssistant) -> Dict[str, str]:
     """获取可用的语音助手Pipeline。"""
     try:
-        # 不使用await，直接获取列表
-        pipeline_list = assist_pipeline.async_get_pipelines(hass)
+        # 获取Pipeline列表
+        pipelines = await assist_pipeline.async_get_pipelines(hass)
         
-        if not pipeline_list:
+        if not pipelines:
             _LOGGER.warning("未找到语音助手Pipeline")
             # 添加一个默认选项，避免UI为空
             return {"default": "默认Pipeline"}
         
         # 转换为字典格式
-        pipelines = {pipeline.id: pipeline.name for pipeline in pipeline_list}
-        return pipelines
+        pipeline_dict = {pipeline.id: pipeline.name for pipeline in pipelines}
+        return pipeline_dict
     except Exception as e:
         _LOGGER.error("获取语音助手Pipeline时出错: %s", e)
         _LOGGER.exception("详细错误:")
@@ -126,19 +108,20 @@ class XiaozhiConfigFlow(ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             try:
-                proxy_mode = user_input.get(CONF_PROXY_MODE, False)
-                
                 # 检查配置的有效性
-                if not proxy_mode and not user_input.get(CONF_PIPELINE_ID):
+                if not user_input.get(CONF_PIPELINE_ID):
                     errors[CONF_PIPELINE_ID] = "missing_pipeline_id"
-                elif proxy_mode and not user_input.get(CONF_FORWARD_URL):
-                    errors[CONF_FORWARD_URL] = "missing_forward_url"
                 else:
-                    # 创建配置条目
-                    return self.async_create_entry(
-                        title="XiaoZhi ESP32 语音助手",
-                        data=user_input,
-                    )
+                    # 验证输入
+                    validation_errors = await validate_input(self.hass, user_input)
+                    if validation_errors:
+                        errors.update(validation_errors)
+                    else:
+                        # 创建配置条目
+                        return self.async_create_entry(
+                            title="XiaoZhi ESP32 语音助手",
+                            data=user_input,
+                        )
                     
             except Exception as exc:
                 _LOGGER.error("配置错误: %s", exc)
@@ -157,30 +140,10 @@ class XiaozhiConfigFlow(ConfigFlow, domain=DOMAIN):
                 TextSelectorConfig(type=TextSelectorType.TEXT)
             ),
             vol.Required(
-                CONF_PROXY_MODE, 
-                default=user_input.get(CONF_PROXY_MODE, False) if user_input else False
-            ): BooleanSelector(),
+                CONF_PIPELINE_ID, 
+                description={"suggested_value": user_input.get(CONF_PIPELINE_ID) if user_input else None}
+            ): vol.In(pipelines)
         })
-        
-        # 如果代理模式为False（即本地处理模式），添加Pipeline选项
-        if not user_input or not user_input.get(CONF_PROXY_MODE, False):
-            schema = schema.extend({
-                vol.Optional(
-                    CONF_PIPELINE_ID, 
-                    description={"suggested_value": user_input.get(CONF_PIPELINE_ID) if user_input else None}
-                ): vol.In(pipelines)
-            })
-        
-        # 如果代理模式为True，添加转发URL选项
-        if user_input and user_input.get(CONF_PROXY_MODE, False):
-            schema = schema.extend({
-                vol.Optional(
-                    CONF_FORWARD_URL, 
-                    description={"suggested_value": user_input.get(CONF_FORWARD_URL) if user_input else None}
-                ): TextSelector(
-                    TextSelectorConfig(type=TextSelectorType.URL)
-                )
-            })
 
         return self.async_show_form(
             step_id="user", 
@@ -214,13 +177,9 @@ class XiaozhiOptionsFlow(OptionsFlow):
         
         if user_input is not None:
             try:
-                proxy_mode = user_input.get(CONF_PROXY_MODE, False)
-                
                 # 检查配置的有效性
-                if not proxy_mode and not user_input.get(CONF_PIPELINE_ID):
+                if not user_input.get(CONF_PIPELINE_ID):
                     errors[CONF_PIPELINE_ID] = "missing_pipeline_id"
-                elif proxy_mode and not user_input.get(CONF_FORWARD_URL):
-                    errors[CONF_FORWARD_URL] = "missing_forward_url"
                 else:
                     # 更新选项
                     return self.async_create_entry(title="", data=user_input)
@@ -240,33 +199,13 @@ class XiaozhiOptionsFlow(OptionsFlow):
                 TextSelectorConfig(type=TextSelectorType.TEXT)
             ),
             vol.Required(
-                CONF_PROXY_MODE, 
-                default=all_data.get(CONF_PROXY_MODE, False)
-            ): BooleanSelector(),
+                CONF_PIPELINE_ID,
+                default=all_data.get(CONF_PIPELINE_ID)
+            ): vol.In(pipelines)
         })
         
-        # 如果代理模式为False（即本地处理模式），添加Pipeline选项
-        if not all_data.get(CONF_PROXY_MODE, False):
-            schema = schema.extend({
-                vol.Optional(
-                    CONF_PIPELINE_ID, 
-                    description={"suggested_value": all_data.get(CONF_PIPELINE_ID)}
-                ): vol.In(pipelines)
-            })
-        
-        # 如果代理模式为True，添加转发URL选项
-        if all_data.get(CONF_PROXY_MODE, False):
-            schema = schema.extend({
-                vol.Optional(
-                    CONF_FORWARD_URL, 
-                    description={"suggested_value": all_data.get(CONF_FORWARD_URL)}
-                ): TextSelector(
-                    TextSelectorConfig(type=TextSelectorType.URL)
-                )
-            })
-
         return self.async_show_form(
-            step_id="init", 
-            data_schema=schema, 
-            errors=errors,
+            step_id="init",
+            data_schema=schema,
+            errors=errors
         ) 

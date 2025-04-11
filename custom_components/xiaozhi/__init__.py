@@ -18,8 +18,6 @@ from .const import (
     CONF_WEBSOCKET_PORT,
     CONF_WEBSOCKET_PATH,
     CONF_PIPELINE_ID,
-    CONF_FORWARD_URL,
-    CONF_PROXY_MODE,
     SERVICE_SEND_TTS,
     SERVICE_GET_CONFIG,
     ATTR_DEVICE_ID,
@@ -55,7 +53,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up XiaoZhi ESP32 from a config entry."""
-    _LOGGER.info("Setting up XiaoZhi ESP32 assistant")
+    _LOGGER.info("设置 XiaoZhi ESP32 语音助手")
     
     try:
         # 存储配置
@@ -65,34 +63,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         pipeline_id = config.get(CONF_PIPELINE_ID)
         port = config.get(CONF_WEBSOCKET_PORT)
         websocket_path = config.get(CONF_WEBSOCKET_PATH)
-        forward_url = config.get(CONF_FORWARD_URL)
-        proxy_mode = config.get(CONF_PROXY_MODE, False)
         
-        # 检查配置
-        if not proxy_mode and not pipeline_id:
-            _LOGGER.error("非代理模式下需要指定语音助手Pipeline")
-            return False
-        
-        if proxy_mode and not forward_url:
-            _LOGGER.error("代理模式下需要指定转发URL")
+        # 检查Pipeline配置
+        if not pipeline_id:
+            _LOGGER.error("需要指定语音助手Pipeline")
             return False
             
-        # 仅在非代理模式下检查Pipeline
-        if not proxy_mode:
-            try:
-                pipelines = await assist_pipeline.async_get_pipelines(hass)
-                pipeline_exists = any(p.id == pipeline_id for p in pipelines)
-                
-                if not pipeline_exists:
-                    _LOGGER.error("指定的语音助手Pipeline不存在: %s", pipeline_id)
-                    return False
-            except Exception as exc:
-                _LOGGER.error("检查Pipeline时出错: %s", exc)
-                # 在代理模式下继续执行，无需Pipeline
-                if not proxy_mode:
-                    return False
-        else:
-            _LOGGER.info("已启用代理模式，将转发请求到: %s", forward_url)
+        # 检查Pipeline是否存在
+        try:
+            pipelines = await assist_pipeline.async_get_pipelines(hass)
+            pipeline_exists = any(p.id == pipeline_id for p in pipelines)
+            
+            if not pipeline_exists:
+                _LOGGER.error("指定的语音助手Pipeline不存在: %s", pipeline_id)
+                return False
+        except Exception as exc:
+            _LOGGER.error("检查Pipeline时出错: %s", exc)
+            return False
             
         # 初始化WebSocket服务
         try:
@@ -103,8 +90,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 port=port, 
                 websocket_path=websocket_path,
                 pipeline_id=pipeline_id,
-                forward_url=forward_url,
-                proxy_mode=proxy_mode
             )
             
             await websocket.start()
@@ -117,7 +102,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             DATA_WEBSOCKET: websocket,
         }
         
-        _LOGGER.info("XiaoZhi ESP32助手WebSocket服务已启动，监听端口 %s，路径 %s", 
+        _LOGGER.info("XiaoZhi ESP32助手服务已启动，监听端口 %s，路径 %s", 
                     port, websocket_path)
         
         # 注册设备连接/断开连接事件处理

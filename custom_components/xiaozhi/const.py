@@ -9,8 +9,6 @@ CONF_NAME = "name"
 CONF_WEBSOCKET_PORT = "websocket_port"
 CONF_WEBSOCKET_PATH = "websocket_path"
 CONF_PIPELINE_ID = "pipeline_id"
-CONF_PROXY_MODE = "proxy_mode"
-CONF_FORWARD_URL = "forward_url"
 
 # 默认值
 DEFAULT_WEBSOCKET_PORT = 6789
