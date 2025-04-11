@@ -26,6 +26,31 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+"""
+小智ESP32设备WebSocket协议说明：
+
+1. 建立连接: 
+   - 设备通过WebSocket连接到服务器
+   - 设备发送hello消息，包含transport和audio_params信息
+   - 服务器必须回复包含transport="websocket"的hello响应
+
+2. 通信格式:
+   - 二进制数据: 音频数据，通常是Opus编码
+   - 文本消息: JSON格式，必须包含type字段
+
+3. 消息类型:
+   - hello: 握手消息
+   - listen: 录音状态控制
+   - abort: 中止当前对话
+   - tts: 文本转语音消息
+   - voice: 语音识别请求
+   - recognition_result: 语音识别结果
+
+4. 错误处理:
+   - ESP32设备端对消息格式有严格要求，缺少字段可能导致崩溃
+   - 必须正确处理二进制数据和文本消息
+"""
+
 class XiaozhiWebSocket:
     """WebSocket服务器组件，处理与ESP32设备的通信。"""
 
@@ -138,6 +163,9 @@ class XiaozhiWebSocket:
                 
                 # 如果是hello消息，则处理
                 if message_type == "hello":
+                    # 打印完整的hello消息内容以便调试
+                    _LOGGER.info("收到hello消息: %s", json.dumps(data))
+                    
                     # 如果header中没有设备ID，尝试从消息中获取
                     if not device_id:
                         device_id = data.get("device_id")
@@ -156,6 +184,12 @@ class XiaozhiWebSocket:
                     # 发送符合小智规范的hello响应 - 关键修改：完全符合小智协议
                     response = {
                         "type": "hello",
+                        "transport": "websocket",  # 添加transport字段
+                        "audio_params": {          # 添加audio_params字段
+                            "sample_rate": 16000,
+                            "format": "opus",
+                            "channels": 1
+                        },
                         "status": "ok"
                     }
                     _LOGGER.debug("发送hello响应: %s", json.dumps(response))
@@ -476,27 +510,59 @@ class XiaozhiWebSocket:
         """处理二进制音频数据。"""
         _LOGGER.debug("收到来自设备 %s 的二进制数据，长度: %d字节", device_id, len(data))
         
-        # 判断是否为代理模式
-        if self.proxy_mode and self.forward_url:
-            # 代理模式下，转发到外部服务
-            await self._forward_binary_data(device_id, data)
-        else:
-            # 本地处理模式，将二进制数据转换为语音命令
-            websocket = self.connections.get(device_id)
-            if not websocket:
-                _LOGGER.error("设备 %s 未连接，无法处理音频数据", device_id)
-                return
+        try:
+            # 判断是否为代理模式
+            if self.proxy_mode and self.forward_url:
+                # 代理模式下，转发到外部服务
+                await self._forward_binary_data(device_id, data)
+            else:
+                # 本地处理模式，将二进制数据转换为语音命令
+                websocket = self.connections.get(device_id)
+                if not websocket:
+                    _LOGGER.error("设备 %s 未连接，无法处理音频数据", device_id)
+                    return
                 
-            # 构造一个模拟的语音消息
-            voice_message = {
-                "type": "voice",
-                "data": data.hex(),  # 将二进制数据转为hex字符串
-                "format": "opus",    # XiaoZhi使用OPUS编码
-                "language": "zh-CN"
-            }
-            
-            # 处理语音消息
-            await self._handle_voice_message(device_id, voice_message, websocket)
+                # 使用Home Assistant语音助手Pipeline处理
+                if self.pipeline_id:
+                    try:
+                        _LOGGER.debug("提交二进制音频数据到Pipeline: %s", self.pipeline_id)
+                        # 提交音频数据到Pipeline
+                        result = await assist_pipeline.async_pipeline_from_audio(
+                            self.hass,
+                            data,  # 直接使用二进制数据
+                            pipeline_id=self.pipeline_id,
+                            language="zh-CN",
+                        )
+                        
+                        if result and result.response:
+                            _LOGGER.debug("语音识别结果: %s", result.response)
+                            
+                            # 返回识别结果
+                            await websocket.send(json.dumps({
+                                "type": WS_MSG_TYPE_RECOGNITION_RESULT,
+                                "text": result.response,
+                                "status": "success"
+                            }))
+                        else:
+                            _LOGGER.warning("语音助手Pipeline没有返回结果")
+                            await websocket.send(json.dumps({
+                                "type": WS_MSG_TYPE_ERROR,
+                                "error": "no_response",
+                                "message": "语音助手没有返回响应"
+                            }))
+                    except Exception as exc:
+                        _LOGGER.error("处理音频数据出错: %s", exc)
+                        traceback.print_exc()
+                        await websocket.send(json.dumps({
+                            "type": WS_MSG_TYPE_ERROR,
+                            "error": "processing_error",
+                            "message": f"音频处理错误: {str(exc)}"
+                        }))
+                else:
+                    _LOGGER.error("未配置语音助手Pipeline")
+        except Exception as exc:
+            _LOGGER.error("处理二进制数据时出错: %s", exc)
+            traceback.print_exc()
     
     async def _forward_binary_data(self, device_id: str, data: bytes) -> None:
         """转发二进制数据到外部服务。"""
@@ -505,11 +571,52 @@ class XiaozhiWebSocket:
             return
             
         try:
-            # 在这里实现转发逻辑
-            _LOGGER.debug("转发二进制数据到: %s", self.forward_url)
-            # 实际的转发实现...
+            # 获取客户端会话
+            session = async_get_clientsession(self.hass)
+            
+            # 将Forward URL从ws开头转换为http开头用于aiohttp请求
+            http_url = self.forward_url.replace("ws://", "http://").replace("wss://", "https://")
+            
+            # 构建请求数据
+            headers = {
+                "Content-Type": "application/octet-stream",
+                "Device-Id": device_id
+            }
+            
+            # 发送二进制数据到外部服务
+            _LOGGER.debug("转发二进制数据到: %s/audio", http_url)
+            
+            # 使用POST请求发送二进制数据
+            async with session.post(
+                f"{http_url}/audio", 
+                data=data,
+                headers=headers
+            ) as response:
+                if response.status == 200:
+                    # 如果响应成功，获取结果并发送给设备
+                    try:
+                        result = await response.json()
+                        # 获取连接的WebSocket
+                        websocket = self.connections.get(device_id)
+                        if websocket and "text" in result:
+                            # 返回识别结果
+                            await websocket.send(json.dumps({
+                                "type": WS_MSG_TYPE_RECOGNITION_RESULT,
+                                "text": result.get("text", ""),
+                                "status": "success"
+                            }))
+                        else:
+                            _LOGGER.warning("无法发送识别结果，设备可能已断开连接")
+                    except Exception as exc:
+                        _LOGGER.error("处理音频响应出错: %s", exc)
+                else:
+                    error_text = await response.text()
+                    _LOGGER.error("转发音频数据失败: %s - %s", response.status, error_text)
+        except aiohttp.ClientError as exc:
+            _LOGGER.error("HTTP请求错误: %s", exc)
         except Exception as exc:
             _LOGGER.error("转发二进制数据时出错: %s", exc)
+            traceback.print_exc()
     
     async def _process_audio_locally(self, device_id: str, audio_data: bytes) -> None:
         """本地处理音频数据。"""
