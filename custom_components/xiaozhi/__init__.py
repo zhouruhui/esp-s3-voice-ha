@@ -77,6 +77,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             if not pipeline_exists:
                 _LOGGER.error("指定的语音助手Pipeline不存在: %s", pipeline_id)
                 return False
+                
+            # 获取Pipeline详情，记录配置信息
+            pipeline = next((p for p in pipelines if p.id == pipeline_id), None)
+            if pipeline:
+                _LOGGER.info("使用语音助手Pipeline: %s", pipeline.name)
+                _LOGGER.debug("Pipeline配置: 语音识别=%s, 对话处理=%s, 文本转语音=%s",
+                             pipeline.stt_engine, 
+                             pipeline.conversation_engine,
+                             pipeline.tts_engine)
         except Exception as exc:
             _LOGGER.error("检查Pipeline时出错: %s", exc)
             return False
@@ -227,7 +236,20 @@ async def _get_device_config(hass: HomeAssistant, service_call: ServiceCall) -> 
         
         # 构建WebSocket URL
         ws_path = websocket.websocket_path.lstrip("/")
-        websocket_url = f"{external_url.rstrip('/')}/{ws_path}"
+        ws_port = websocket.port
+        
+        # 处理URL端口
+        base_url = external_url.rstrip('/')
+        if ":" in base_url.split("//")[1]:
+            # URL已经包含端口，需要替换
+            base_parts = base_url.split(":")
+            base_url = ":".join(base_parts[:-1]) + f":{ws_port}"
+        else:
+            # URL不包含端口，添加端口
+            base_url = f"{base_url}:{ws_port}"
+        
+        # 构建完整的WebSocket URL
+        websocket_url = f"{base_url}/{ws_path}"
         
         # 将http改为ws，https改为wss
         websocket_url = websocket_url.replace("http://", "ws://").replace("https://", "wss://")
@@ -237,15 +259,58 @@ async def _get_device_config(hass: HomeAssistant, service_call: ServiceCall) -> 
             "device_id": device_id,
             "websocket_url": websocket_url,
             "reconnect_interval": 5000,
-            "ping_interval": 30000
+            "ping_interval": 30000,
+            "audio_params": {
+                "sample_rate": 16000,
+                "format": "opus",  # 或者 "raw"，根据设备支持情况
+                "channels": 1
+            }
         }
         
-        # 在日志中显示配置信息，实际应用中应该创建通知或UI显示
+        # 生成ESP32配置代码
+        esp32_config = f'''
+// XiaoZhi ESP32 设备配置
+#define XIAOZHI_DEVICE_ID "{device_id}"
+#define XIAOZHI_WEBSOCKET_URL "{websocket_url}"
+#define XIAOZHI_RECONNECT_INTERVAL {config_info["reconnect_interval"]}
+#define XIAOZHI_PING_INTERVAL {config_info["ping_interval"]}
+        '''
+        
+        # 在日志中显示配置信息
         _LOGGER.info("XiaoZhi ESP32设备配置信息:")
         _LOGGER.info("设备ID: %s", config_info["device_id"])
         _LOGGER.info("WebSocket URL: %s", config_info["websocket_url"])
         _LOGGER.info("重连间隔(ms): %s", config_info["reconnect_interval"])
         _LOGGER.info("心跳间隔(ms): %s", config_info["ping_interval"])
+        _LOGGER.info("音频参数: %s", config_info["audio_params"])
+        _LOGGER.info("\nESP32配置代码:")
+        _LOGGER.info(esp32_config)
         _LOGGER.info("请将此配置信息用于ESP32固件编译")
+        
+        # 创建持久通知，显示配置信息
+        notification_service = hass.services.async_get("persistent_notification")
+        if notification_service:
+            await hass.services.async_call(
+                "persistent_notification",
+                "create",
+                {
+                    "title": "XiaoZhi ESP32 设备配置",
+                    "message": f"""
+### 设备配置信息
+
+**设备ID**: `{config_info["device_id"]}`  
+**WebSocket URL**: `{config_info["websocket_url"]}`  
+**重连间隔**: {config_info["reconnect_interval"]}ms  
+**心跳间隔**: {config_info["ping_interval"]}ms  
+
+### ESP32配置代码
+```c
+{esp32_config}
+```
+
+请将上述配置用于ESP32固件编译。
+                    """
+                },
+            )
     except Exception as exc:
-        _LOGGER.error("获取设备配置时出错: %s", exc) 
+        _LOGGER.error("生成设备配置信息时出错: %s", exc) 

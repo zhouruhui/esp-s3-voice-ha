@@ -53,8 +53,35 @@ WS_MSG_TYPE_DEVICE_INFO = "device_info"
 WS_MSG_TYPE_DEVICE_STATUS = "device_status"
 WS_MSG_TYPE_EMOTION = "emotion"
 WS_MSG_TYPE_ERROR = "error"
+WS_MSG_TYPE_AUTH = "auth"
+WS_MSG_TYPE_PING = "ping"
+WS_MSG_TYPE_PONG = "pong"
+WS_MSG_TYPE_TTS = "tts"
+WS_MSG_TYPE_AUDIO_DATA = "audio_data"
+WS_MSG_TYPE_COMMAND = "command"
+WS_MSG_TYPE_NOTIFICATION = "notification"
+
+# TTS状态
+TTS_STATE_START = "sentence_start"
+TTS_STATE_END = "sentence_end"
+TTS_STATE_ERROR = "error"
+
+# 音频格式
+AUDIO_FORMAT_OPUS = "opus"
+AUDIO_FORMAT_RAW = "raw"
+AUDIO_FORMAT_MP3 = "mp3"
+AUDIO_FORMAT_WAV = "wav"
+
+# 设备状态
+DEVICE_STATUS_IDLE = "idle"
+DEVICE_STATUS_LISTENING = "listening"
+DEVICE_STATUS_PROCESSING = "processing"
+DEVICE_STATUS_SPEAKING = "speaking"
 
 # Error codes
 ERR_INVALID_MESSAGE = "invalid_message"
 ERR_UNAUTHORIZED = "unauthorized"
-ERR_SERVER_ERROR = "server_error" 
+ERR_SERVER_ERROR = "server_error"
+ERR_PIPELINE_ERROR = "pipeline_error"
+ERR_MISSING_PIPELINE = "missing_pipeline"
+ERR_PROCESSING_ERROR = "processing_error" 
