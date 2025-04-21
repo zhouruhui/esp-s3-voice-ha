@@ -290,8 +290,7 @@ async def _get_device_config(hass: HomeAssistant, service_call: ServiceCall) -> 
         _LOGGER.info("请将此配置信息用于ESP32固件编译")
         
         # 创建持久通知，显示配置信息
-        notification_service = hass.services.async_get("persistent_notification")
-        if notification_service:
+        try:
             await hass.services.async_call(
                 "persistent_notification",
                 "create",
@@ -314,5 +313,8 @@ async def _get_device_config(hass: HomeAssistant, service_call: ServiceCall) -> 
                     """
                 },
             )
+            _LOGGER.info("已创建配置通知")
+        except Exception as exc:
+            _LOGGER.error("创建通知时出错: %s", exc)
     except Exception as exc:
         _LOGGER.error("生成设备配置信息时出错: %s", exc) 
