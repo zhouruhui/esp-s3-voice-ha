@@ -56,7 +56,7 @@ async def validate_input(hass: HomeAssistant, data: dict) -> dict:
             return errors
         
         try:
-            pipelines = await assist_pipeline.async_get_pipelines(hass)
+            pipelines = assist_pipeline.async_get_pipelines(hass)
             if not any(p.id == pipeline_id for p in pipelines):
                 errors["base"] = "pipeline_not_found"
         except Exception as ex:
@@ -72,8 +72,8 @@ async def validate_input(hass: HomeAssistant, data: dict) -> dict:
 async def _async_get_pipelines(hass: HomeAssistant) -> Dict[str, str]:
     """获取可用的语音助手Pipeline。"""
     try:
-        # 获取Pipeline列表
-        pipelines = await assist_pipeline.async_get_pipelines(hass)
+        # 获取Pipeline列表 - 不使用await，直接调用
+        pipelines = assist_pipeline.async_get_pipelines(hass)
         
         if not pipelines:
             _LOGGER.warning("未找到语音助手Pipeline")

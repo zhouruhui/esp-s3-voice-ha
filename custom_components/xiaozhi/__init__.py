@@ -71,7 +71,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             
         # 检查Pipeline是否存在
         try:
-            pipelines = await assist_pipeline.async_get_pipelines(hass)
+            pipelines = assist_pipeline.async_get_pipelines(hass)
             pipeline_exists = any(p.id == pipeline_id for p in pipelines)
             
             if not pipeline_exists:

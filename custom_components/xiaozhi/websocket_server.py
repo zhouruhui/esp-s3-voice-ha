@@ -307,7 +307,7 @@ class XiaozhiWebSocket:
             
             try:
                 # 使用语音助手Pipeline处理TTS
-                pipeline = await assist_pipeline.async_get_pipeline(self.hass, self.pipeline_id)
+                pipeline = assist_pipeline.async_get_pipeline(self.hass, self.pipeline_id)
                 if not pipeline or not pipeline.tts_engine:
                     _LOGGER.error("Pipeline不支持TTS功能")
                     await websocket.send(json.dumps({
