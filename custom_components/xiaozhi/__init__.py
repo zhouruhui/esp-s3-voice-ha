@@ -143,10 +143,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             schema=SEND_TTS_SCHEMA,
         )
         
+        from functools import partial
+        # 注册服务 - 使用partial预填充hass参数
         hass.services.async_register(
             DOMAIN,
             SERVICE_GET_CONFIG,
-            _get_device_config,
+            partial(_get_device_config, hass),
             schema=GET_DEVICE_CONFIG_SCHEMA,
         )
         
