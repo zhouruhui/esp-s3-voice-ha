@@ -241,7 +241,6 @@ class XiaozhiWebSocket:
                         # 处理文本消息
                         data = json.loads(message)
                         message_type = data.get("type", "unknown")
-                        _LOGGER.debug("收到来自设备 %s 的文本消息: %s", device_id, message_type)
                         
                         # 根据消息类型处理
                         if message_type == "start_listen":
@@ -269,26 +268,22 @@ class XiaozhiWebSocket:
                             await websocket.send(json.dumps({"type": "iot_response", "status": "ok"}))
                         elif message_type == "listen":
                             # 处理listen消息，设备发送的录音状态
-                            _LOGGER.debug("收到listen消息: %s", data)
                             # 返回录音确认
                             await websocket.send(json.dumps({"type": "listen_response", "status": "ok"}))
                         else:
-                            _LOGGER.warning("未识别的消息类型: %s，消息内容: %s", message_type, json.dumps(data))
+                            _LOGGER.warning("未识别的消息类型: %s", message_type)
                     else:
                         # 处理二进制数据 (音频数据)
-                        _LOGGER.debug("收到来自设备 %s 的二进制数据，长度: %d字节", device_id, len(message))
                         await self._handle_binary_message(device_id, message, websocket)
                         
                 except json.JSONDecodeError:
                     _LOGGER.warning("收到无效的JSON消息")
                 except Exception as exc:
                     _LOGGER.error("处理消息时出错: %s", exc)
-                    traceback.print_exc()
         except ConnectionClosed:
             _LOGGER.info("设备 %s 的连接已关闭", device_id)
         except Exception as exc:
             _LOGGER.error("_handle_messages 出错: %s", exc)
-            traceback.print_exc()
 
     async def send_tts_message(self, device_id: str, message: str) -> None:
         """发送TTS消息到设备。"""
@@ -316,56 +311,35 @@ class XiaozhiWebSocket:
             }))
             
             try:
-                # 使用语音助手Pipeline处理TTS
-                pipeline = assist_pipeline.async_get_pipeline(self.hass, self.pipeline_id)
-                if not pipeline or not pipeline.tts_engine:
-                    _LOGGER.error("Pipeline不支持TTS功能")
-                    await websocket.send(json.dumps({
-                        "type": WS_MSG_TYPE_TTS,
-                        "state": TTS_STATE_ERROR,
-                        "message": "TTS引擎不可用"
-                    }))
-                    return
-                
-                # 获取设备支持的音频格式
-                # 未来可以从设备信息中获取，现在假设支持opus
-                audio_format = AUDIO_FORMAT_OPUS
-                
-                # 生成TTS音频
-                tts_audio = await assist_pipeline.async_pipeline_from_tts(
-                    self.hass,
-                    text=message,
-                    pipeline_id=self.pipeline_id,
+                # 直接使用TTS API
+                tts_output = await self.hass.services.async_call(
+                    "tts",
+                    "speak",
+                    {
+                        "entity_id": "media_player.xiaozhi_tts",  # 可以是任意媒体播放器
+                        "message": message,
+                        "cache": False
+                    },
+                    blocking=True,
+                    return_response=True
                 )
                 
-                if tts_audio and tts_audio.audio_output:
-                    # 如果设备支持接收音频数据，则发送二进制音频数据
-                    # 首先发送音频元数据
-                    await websocket.send(json.dumps({
-                        "type": WS_MSG_TYPE_AUDIO_DATA,
-                        "format": audio_format,
-                        "sample_rate": 16000,
-                        "channels": 1
-                    }))
-                    
-                    # 然后发送二进制音频数据
-                    await websocket.send(tts_audio.audio_output)
+                # 获取音频数据URL或内容
+                if tts_output:
+                    # 告知设备TTS生成成功
+                    _LOGGER.info("TTS消息已发送到设备 %s", device_id)
                 else:
                     _LOGGER.warning("生成TTS音频失败")
             except Exception as exc:
                 _LOGGER.error("生成TTS音频时出错: %s", exc)
-                traceback.print_exc()
                 
-            # 假设TTS处理完成，发送结束消息
+            # 发送结束消息
             await websocket.send(json.dumps({
                 "type": WS_MSG_TYPE_TTS, 
                 "state": TTS_STATE_END
             }))
-            
-            _LOGGER.debug("已发送TTS消息到设备 %s: %s", device_id, message)
         except Exception as exc:
             _LOGGER.error("发送TTS消息时出错: %s", exc)
-            traceback.print_exc()
 
     def get_connected_devices(self) -> List[str]:
         """获取已连接设备列表。"""
@@ -398,8 +372,6 @@ class XiaozhiWebSocket:
         
     async def _handle_binary_message(self, device_id: str, data: bytes, websocket) -> None:
         """处理二进制音频数据。"""
-        _LOGGER.debug("接收到音频数据：长度 %d 字节", len(data))
-        
         try:
             if not self.pipeline_id:
                 _LOGGER.error("未配置语音助手Pipeline")
@@ -412,61 +384,49 @@ class XiaozhiWebSocket:
                 
             # 使用Home Assistant语音助手Pipeline处理
             try:
-                _LOGGER.debug("提交音频数据到Pipeline: %s", self.pipeline_id)
-                
-                # 获取Pipeline运行时会话
-                pipeline_run = assist_pipeline.async_pipeline_from_audio_stream(
+                # 使用单次调用API处理音频数据
+                result = await assist_pipeline.async_pipeline_from_audio(
                     self.hass,
+                    audio=data,  # 直接使用二进制数据
                     pipeline_id=self.pipeline_id,
                     device_id=device_id,
                     conversation_id=None,  # 使用新的对话ID
                 )
                 
-                # 创建音频处理上下文
-                async with pipeline_run:
-                    # 发送音频数据到Pipeline
-                    await pipeline_run.process_audio(data)
-                    # 表示音频流结束
-                    await pipeline_run.process_audio(None)
+                if result and result.response:
+                    _LOGGER.info("语音识别结果: %s", result.response)
                     
-                    # 等待处理完成并获取结果
-                    result = await pipeline_run.wait_for_response()
+                    # 返回识别结果
+                    await websocket.send(json.dumps({
+                        "type": "recognition_result",
+                        "text": result.response,
+                        "status": "success"
+                    }))
                     
-                    if result and result.response:
-                        _LOGGER.debug("语音识别结果: %s", result.response)
-                        
-                        # 返回识别结果
+                    # 如果有TTS响应，则发送到设备
+                    if hasattr(result, 'tts_output') and result.tts_output:
+                        # 告知设备TTS开始
                         await websocket.send(json.dumps({
-                            "type": "recognition_result",
-                            "text": result.response,
-                            "status": "success"
+                            "type": WS_MSG_TYPE_TTS_START,
+                            "message": result.response
                         }))
                         
-                        # 如果有TTS响应，则发送到设备
-                        if result.tts_output:
-                            # 告知设备TTS开始
-                            await websocket.send(json.dumps({
-                                "type": WS_MSG_TYPE_TTS_START,
-                                "message": result.response
-                            }))
-                            
-                            # 如果有TTS音频数据，可以发送给设备
-                            # 这里需要根据设备能力决定是发送TTS文本还是音频
-                            
-                            # 告知设备TTS结束
-                            await websocket.send(json.dumps({
-                                "type": WS_MSG_TYPE_TTS_END
-                            }))
-                    else:
-                        _LOGGER.warning("语音助手Pipeline没有返回结果")
+                        # 如果有TTS音频数据，可以发送给设备
+                        # 这里需要根据设备能力决定是发送TTS文本还是音频
+                        
+                        # 告知设备TTS结束
                         await websocket.send(json.dumps({
-                            "type": "error",
-                            "error": "no_response",
-                            "message": "语音助手没有返回响应"
+                            "type": WS_MSG_TYPE_TTS_END
                         }))
+                else:
+                    _LOGGER.warning("语音助手Pipeline没有返回结果")
+                    await websocket.send(json.dumps({
+                        "type": "error",
+                        "error": "no_response",
+                        "message": "语音助手没有返回响应"
+                    }))
             except Exception as exc:
                 _LOGGER.error("处理音频数据出错: %s", exc)
-                traceback.print_exc()
                 await websocket.send(json.dumps({
                     "type": "error",
                     "error": "processing_error",
@@ -474,7 +434,6 @@ class XiaozhiWebSocket:
                 }))
         except Exception as exc:
             _LOGGER.error("处理二进制数据时出错: %s", exc)
-            traceback.print_exc()
 
     async def _handle_auth_message(self, device_id: str, data: Dict, websocket) -> None:
         """处理auth认证消息。"""
