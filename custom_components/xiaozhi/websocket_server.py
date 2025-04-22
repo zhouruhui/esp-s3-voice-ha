@@ -262,8 +262,18 @@ class XiaozhiWebSocket:
                         elif message_type == "ping":
                             # 心跳响应
                             await websocket.send(json.dumps({"type": "pong"}))
+                        elif message_type == "iot":
+                            # 处理IoT消息，设备可能发送的控制命令
+                            _LOGGER.debug("收到IoT消息: %s", data)
+                            # 简单回复确认
+                            await websocket.send(json.dumps({"type": "iot_response", "status": "ok"}))
+                        elif message_type == "listen":
+                            # 处理listen消息，设备发送的录音状态
+                            _LOGGER.debug("收到listen消息: %s", data)
+                            # 返回录音确认
+                            await websocket.send(json.dumps({"type": "listen_response", "status": "ok"}))
                         else:
-                            _LOGGER.warning("未识别的消息类型: %s", message_type)
+                            _LOGGER.warning("未识别的消息类型: %s，消息内容: %s", message_type, json.dumps(data))
                     else:
                         # 处理二进制数据 (音频数据)
                         _LOGGER.debug("收到来自设备 %s 的二进制数据，长度: %d字节", device_id, len(message))
@@ -326,7 +336,6 @@ class XiaozhiWebSocket:
                     self.hass,
                     text=message,
                     pipeline_id=self.pipeline_id,
-                    language="zh-CN",
                 )
                 
                 if tts_audio and tts_audio.audio_output:
@@ -411,7 +420,6 @@ class XiaozhiWebSocket:
                     pipeline_id=self.pipeline_id,
                     device_id=device_id,
                     conversation_id=None,  # 使用新的对话ID
-                    language="zh-CN",
                 )
                 
                 # 创建音频处理上下文

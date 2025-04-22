@@ -131,7 +131,23 @@ class XiaozhiDeviceConnectionSensor(BinarySensorEntity, RestoreEntity):
             if event.data.get("device_id") == self.device_id:
                 self._attr_is_on = True
                 self._attr_extra_state_attributes["status"] = "online"
-                self._attr_extra_state_attributes["last_seen"] = self.hass.states.get("sensor.date_time").state
+                
+                # 安全获取日期时间
+                import datetime
+                date_time_state = None
+                try:
+                    # 尝试从HA状态获取日期时间
+                    date_time_entity = self.hass.states.get("sensor.date_time")
+                    if date_time_entity and date_time_entity.state:
+                        date_time_state = date_time_entity.state
+                except Exception:
+                    pass
+                    
+                # 如果HA中没有日期时间传感器，使用系统时间
+                if not date_time_state:
+                    date_time_state = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                
+                self._attr_extra_state_attributes["last_seen"] = date_time_state
                 self.async_write_ha_state()
                 
         @callback
@@ -154,7 +170,23 @@ class XiaozhiDeviceConnectionSensor(BinarySensorEntity, RestoreEntity):
         if self.device_id in self.websocket.get_connected_devices():
             self._attr_is_on = True
             self._attr_extra_state_attributes["status"] = "online"
-            self._attr_extra_state_attributes["last_seen"] = self.hass.states.get("sensor.date_time").state
+            
+            # 安全获取日期时间
+            import datetime
+            date_time_state = None
+            try:
+                # 尝试从HA状态获取日期时间
+                date_time_entity = self.hass.states.get("sensor.date_time")
+                if date_time_entity and date_time_entity.state:
+                    date_time_state = date_time_entity.state
+            except Exception:
+                pass
+                
+            # 如果HA中没有日期时间传感器，使用系统时间
+            if not date_time_state:
+                date_time_state = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            self._attr_extra_state_attributes["last_seen"] = date_time_state
         else:
             self._attr_is_on = False
             self._attr_extra_state_attributes["status"] = "offline"
