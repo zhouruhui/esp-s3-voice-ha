@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import traceback
+import time
 from typing import Any, Dict, List, Optional, Set, Callable
 
 import voluptuous as vol
@@ -80,6 +81,12 @@ class XiaozhiWebSocket:
         # 回调函数
         self.on_device_connected: Optional[Callable[[str], None]] = None
         self.on_device_disconnected: Optional[Callable[[str], None]] = None
+        
+        # 添加调试标志
+        self.debug_mode = True
+        _LOGGER.info("XiaoZhi WebSocket服务器初始化, 调试模式: %s, 测试命令: %s", 
+                    "启用" if TEST_MODE else "禁用", 
+                    TEST_COMMAND if TEST_MODE else "无")
 
     async def start(self) -> None:
         """启动WebSocket服务器。"""
@@ -362,14 +369,27 @@ class XiaozhiWebSocket:
         
     async def _handle_wakeword_detected(self, device_id: str, data: Dict) -> None:
         """处理唤醒词检测消息。"""
-        _LOGGER.debug("处理唤醒词检测消息: %s", data)
-        # 可以触发Home Assistant事件
         wakeword = data.get("wakeword", "unknown")
+        _LOGGER.info("设备 %s 检测到唤醒词: %s", device_id, wakeword)
+        
+        # 可以触发Home Assistant事件
         self.hass.bus.async_fire(
             "xiaozhi_wakeword_detected",
             {"device_id": device_id, "wakeword": wakeword}
         )
         
+        # 回复设备，确认收到唤醒词
+        if device_id in self.connections:
+            websocket = self.connections[device_id]
+            try:
+                await websocket.send(json.dumps({
+                    "type": "wakeword_response",
+                    "status": "ok"
+                }))
+                _LOGGER.debug("已向设备 %s 发送唤醒词响应", device_id)
+            except Exception as exc:
+                _LOGGER.error("发送唤醒词响应出错: %s", exc)
+
     async def _handle_abort(self, device_id: str, data: Dict) -> None:
         """处理中止消息。"""
         _LOGGER.debug("处理中止消息: %s", data)
@@ -378,6 +398,19 @@ class XiaozhiWebSocket:
     async def _handle_binary_message(self, device_id: str, data: bytes, websocket) -> None:
         """处理二进制音频数据。"""
         try:
+            _LOGGER.info("接收到来自设备 %s 的音频数据: %d 字节", device_id, len(data))
+            
+            # 保存少量音频数据用于调试
+            try:
+                debug_dir = os.path.join(self.hass.config.config_dir, "xiaozhi_debug")
+                os.makedirs(debug_dir, exist_ok=True)
+                debug_file = os.path.join(debug_dir, f"audio_{device_id}_{int(time.time())}.bin")
+                with open(debug_file, "wb") as f:
+                    f.write(data[:min(1024, len(data))])  # 只保存前1KB数据
+                _LOGGER.info("已保存音频调试数据到 %s", debug_file)
+            except Exception as exc:
+                _LOGGER.error("保存音频调试数据失败: %s", exc)
+            
             if not self.pipeline_id:
                 _LOGGER.error("未配置语音助手Pipeline")
                 await websocket.send(json.dumps({
@@ -389,10 +422,8 @@ class XiaozhiWebSocket:
                 
             # 使用Home Assistant的对话API处理
             try:
-                # 先使用语音识别服务转换音频到文本
-                stt_result = None
-                
                 # 尝试直接使用对话API
+                _LOGGER.info("调用对话API, 命令: %s", TEST_COMMAND)
                 conversation_result = await self.hass.services.async_call(
                     "conversation",
                     "process",
@@ -404,6 +435,8 @@ class XiaozhiWebSocket:
                     blocking=True,
                     return_response=True
                 )
+                
+                _LOGGER.info("对话API返回结果: %s", str(conversation_result)[:200])
                 
                 if conversation_result and "response" in conversation_result:
                     response_text = conversation_result["response"]["speech"]["plain"]["speech"]
@@ -426,6 +459,8 @@ class XiaozhiWebSocket:
                     await websocket.send(json.dumps({
                         "type": WS_MSG_TYPE_TTS_END
                     }))
+                    
+                    _LOGGER.info("已向设备 %s 发送响应消息", device_id)
                 else:
                     _LOGGER.warning("对话API没有返回结果")
                     await websocket.send(json.dumps({
@@ -434,7 +469,7 @@ class XiaozhiWebSocket:
                         "message": "语音助手没有返回响应"
                     }))
             except Exception as exc:
-                _LOGGER.error("处理音频数据出错: %s", exc)
+                _LOGGER.error("调用对话API出错: %s", exc)
                 await websocket.send(json.dumps({
                     "type": "error",
                     "error": "processing_error",
