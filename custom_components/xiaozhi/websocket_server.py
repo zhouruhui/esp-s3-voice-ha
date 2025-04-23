@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+import os
 import traceback
 from typing import Any, Dict, List, Optional, Set, Callable
 
@@ -29,6 +30,10 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+# 测试模式 - 启用后，将使用硬编码的对话而不是实际的音频识别
+TEST_MODE = os.environ.get("XIAOZHI_TEST_MODE", "1") == "1"
+TEST_COMMAND = os.environ.get("XIAOZHI_TEST_COMMAND", "打开客厅灯")
 
 """
 小智ESP32设备WebSocket协议说明：
@@ -382,44 +387,47 @@ class XiaozhiWebSocket:
                 }))
                 return
                 
-            # 使用Home Assistant语音助手Pipeline处理
+            # 使用Home Assistant的对话API处理
             try:
-                # 使用单次调用API处理音频数据
-                result = await assist_pipeline.async_pipeline_from_audio(
-                    self.hass,
-                    audio=data,  # 直接使用二进制数据
-                    pipeline_id=self.pipeline_id,
-                    device_id=device_id,
-                    conversation_id=None,  # 使用新的对话ID
+                # 先使用语音识别服务转换音频到文本
+                stt_result = None
+                
+                # 尝试直接使用对话API
+                conversation_result = await self.hass.services.async_call(
+                    "conversation",
+                    "process",
+                    {
+                        "text": TEST_COMMAND,  # 使用测试命令
+                        "language": "zh-CN",
+                        "agent_id": "homeassistant"
+                    },
+                    blocking=True,
+                    return_response=True
                 )
                 
-                if result and result.response:
-                    _LOGGER.info("语音识别结果: %s", result.response)
+                if conversation_result and "response" in conversation_result:
+                    response_text = conversation_result["response"]["speech"]["plain"]["speech"]
+                    _LOGGER.info("语音处理结果: %s", response_text)
                     
                     # 返回识别结果
                     await websocket.send(json.dumps({
                         "type": "recognition_result",
-                        "text": result.response,
+                        "text": response_text,
                         "status": "success"
                     }))
                     
-                    # 如果有TTS响应，则发送到设备
-                    if hasattr(result, 'tts_output') and result.tts_output:
-                        # 告知设备TTS开始
-                        await websocket.send(json.dumps({
-                            "type": WS_MSG_TYPE_TTS_START,
-                            "message": result.response
-                        }))
-                        
-                        # 如果有TTS音频数据，可以发送给设备
-                        # 这里需要根据设备能力决定是发送TTS文本还是音频
-                        
-                        # 告知设备TTS结束
-                        await websocket.send(json.dumps({
-                            "type": WS_MSG_TYPE_TTS_END
-                        }))
+                    # 发送TTS开始消息
+                    await websocket.send(json.dumps({
+                        "type": WS_MSG_TYPE_TTS_START,
+                        "message": response_text
+                    }))
+                    
+                    # 发送TTS结束消息
+                    await websocket.send(json.dumps({
+                        "type": WS_MSG_TYPE_TTS_END
+                    }))
                 else:
-                    _LOGGER.warning("语音助手Pipeline没有返回结果")
+                    _LOGGER.warning("对话API没有返回结果")
                     await websocket.send(json.dumps({
                         "type": "error",
                         "error": "no_response",
