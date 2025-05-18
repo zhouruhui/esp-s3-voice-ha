@@ -31,11 +31,20 @@ substitutions:
   allowed_characters: " !#%'()+,-./0123456789:;<>?@ABCDEFGHIJKLMNOPQRSTUVWYZ[]_abcdefghijklmnopqrstuvwxyz{|}°²³µ¿ÁÂÄÅÉÖÚßàáâãäåæçèéêëìíîðñòóôõöøùúûüýþāăąćčďĐđēėęěğĮįıļľŁłńňőřśšťũūůűųźŻżŽžơưșțΆΈΌΐΑΒΓΔΕΖΗΘΚΜΝΠΡΣΤΥΦάέήίαβγδεζηθικλμνξοπρςστυφχψωϊόύώАБВГДЕЖЗИКЛМНОПРСТУХЦЧШЪЭЮЯабвгдежзийклмнопрстуфхцчшщъыьэюяёђєіїјљњћאבגדהוזחטיכלםמןנסעפץצקרשת،ءآأإئابةتجحخدذرزسشصضطظعغفقكلمنهوىيٹپچڈکگںھہیےংকচতধনফবযরলশষস়ািু্చయలిెొ్ംഅആഇഈഉഎഓകഗങചജഞടഡണതദധനപഫബഭമയരറലളവശസഹാിീുൂെേൈ്ൺൻർൽൾაბგდევზთილმნოპრსტუფქყშჩცძჭხạảấầẩậắặẹẽếềểệỉịọỏốồổỗộớờởợụủứừửữựỳ—、一上不个中为主乾了些亮人任低佔何作供依侧係個側偵充光入全关冇冷几切到制前動區卧厅厨及口另右吊后吗启吸呀咗哪唔問啟嗎嘅嘛器圍在场執場外多大始安定客室家密寵对將小少左已帘常幫幾库度庫廊廚廳开式後恆感態成我戲戶户房所扇手打执把拔换掉控插摄整斯新明是景暗更最會有未本模機檯櫃欄次正氏水沒没洗活派温測源溫漏潮激濕灯為無煙照熱燈燥物狀玄现現瓦用發的盞目着睡私空窗立笛管節簾籬紅線红罐置聚聲脚腦腳臥色节著行衣解設調請謝警设调走路車车运連遊運過道邊部都量鎖锁門閂閉開關门闭除隱離電震霧面音頂題顏颜風风食餅餵가간감갔강개거게겨결경고공과관그금급기길깥꺼껐꼽나난내네놀누는능니다닫담대더데도동됐되된됨둡드든등디때떤뜨라래러렇렌려로료른를리림링마많명몇모무문물뭐바밝방배변보부불블빨뽑사산상색서설성세센션소쇼수스습시신실싱아안않알았애야어얼업없었에여연열옆오온완외왼요운움워원위으은을음의이인일임입있작잠장재전절정제져조족종주줄중줘지직진짐쪽차창천최추출충치침커컴켜켰쿠크키탁탄태탬터텔통트튼티파팬퍼폰표퓨플핑한함해했행혀현화활후휴힘，？"
 
   # Add support for non-unicode characters by using better glyphset
-  font_glyphsets: "GF_Latin_Core"
-  # for Greek use "Noto Sans" for other languages use a compatible font family
-  font_family: Figtree
+  font_glyphsets: "GF_Latin_Core GF_Simplified_Chinese"
+  # 更改字体以支持中文
+  font_family: "Noto Sans SC"
 
   micro_wake_word_model: wn9s_hilexin  # 使用乐鑫官方的"Hi,乐鑫"唤醒词模型
+
+  # 中文界面文本
+  display_text_ready: "准备就绪"
+  display_text_listening: "正在聆听..."
+  display_text_thinking: "正在思考..."
+  display_text_replying: "正在回复..."
+  display_text_error: "出现错误"
+  display_text_timer_finished: "计时结束"
+  display_text_muted: "已静音"
 
 esphome:
   name: ${name}
@@ -54,12 +63,12 @@ esphome:
             - lambda: id(init_in_progress) = false;
             - script.execute: draw_display
 
-# 添加ESP-SR外部组件
-external_components:
-  - source: github://espressif/esp-sr
-    components: [esp_sr]
-    refresh: 0s
-
+# 使用ESP32内置的语音助手组件
+esp32_voice_assistant:
+  wake_word: 
+    language: zh-CN
+    model: hilexin
+  
 esp32:
   board: esp32s3box
   flash_size: 16MB
@@ -190,6 +199,10 @@ media_player:
     files:
       - id: timer_finished_sound
         file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/timer_finished.flac
+      - id: wake_word_triggered_sound
+        file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/wake_word_triggered.flac
+      - id: error_sound
+        file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/error.flac
     on_announcement:
       - if:
           condition:
@@ -211,6 +224,9 @@ micro_wake_word:
   models:
     - ${micro_wake_word_model}
   on_wake_word_detected:
+    - media_player.speaker.play_on_device_media_file:
+        media_file: wake_word_triggered_sound
+        announcement: true
     - voice_assistant.start:
         wake_word: !lambda return wake_word;
 
@@ -221,6 +237,18 @@ voice_assistant:
   noise_suppression_level: 2
   auto_gain: 31dBFS
   volume_multiplier: 2.0
+  use_wake_word: true
+  on_start:
+    then:
+      - lambda: id(voice_assistant_phase) = ${voice_assist_listening_phase_id};
+      - script.execute: draw_display
+      - if:
+          condition:
+            text_sensor.has_state: text_response
+          then:
+            - text_sensor.template.publish:
+                id: text_response
+                state: ""
   on_listening:
     - lambda: id(voice_assistant_phase) = ${voice_assist_listening_phase_id};
     - text_sensor.template.publish:
@@ -273,6 +301,9 @@ voice_assistant:
           lambda: return !id(init_in_progress);
         then:
           - lambda: id(voice_assistant_phase) = ${voice_assist_error_phase_id};
+          - media_player.speaker.play_on_device_media_file:
+              media_file: error_sound
+              announcement: true
           - script.execute: draw_display
           - delay: 1s
           - if:
@@ -511,7 +542,6 @@ switch:
           condition:
             lambda: return !id(init_in_progress);
           then:
-            - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
             - if:
                 condition:
                   not:
@@ -718,9 +748,9 @@ text_sensor:
     platform: template
     on_value:
       lambda: |-
-        if(id(text_request).state.length()>32) {
+        if(id(text_request).state.length()>24) {
           std::string name = id(text_request).state.c_str();
-          std::string truncated = esphome::str_truncate(name.c_str(),31);
+          std::string truncated = esphome::str_truncate(name.c_str(),23);
           id(text_request).state = (truncated+"...").c_str();
         }
 
@@ -728,9 +758,9 @@ text_sensor:
     platform: template
     on_value:
       lambda: |-
-        if(id(text_response).state.length()>32) {
+        if(id(text_response).state.length()>24) {
           std::string name = id(text_response).state.c_str();
-          std::string truncated = esphome::str_truncate(name.c_str(),31);
+          std::string truncated = esphome::str_truncate(name.c_str(),23);
           id(text_response).state = (truncated+"...").c_str();
         }
 
@@ -824,3 +854,46 @@ display:
           it.fill(Color::BLACK);
           id(draw_timer_timeline).execute();
           id(draw_active_timer_widget).execute();
+
+  # for each of the various phases
+  - id: voice_assist_idle_phase_id
+    lambda: |-
+      return display::DisplayBuffer::PHASE_IDLE;
+    text_font_id: ttfid2
+    text: ${display_text_ready}
+
+  - id: voice_assist_listening_phase_id
+    lambda: |-
+      return display::DisplayBuffer::PHASE_LISTENING;
+    text_font_id: ttfid2
+    text: ${display_text_listening}
+
+  - id: voice_assist_thinking_phase_id
+    lambda: |-
+      return display::DisplayBuffer::PHASE_THINKING;
+    text_font_id: ttfid2
+    text: ${display_text_thinking}
+
+  - id: voice_assist_replying_phase_id
+    lambda: |-
+      return display::DisplayBuffer::PHASE_REPLYING;
+    text_font_id: ttfid2
+    text: ${display_text_replying}
+
+  - id: voice_assist_error_phase_id
+    lambda: |-
+      return display::DisplayBuffer::PHASE_ERROR;
+    text_font_id: ttfid2
+    text: ${display_text_error}
+
+  - id: voice_assist_timer_finished_phase_id
+    lambda: |-
+      return display::DisplayBuffer::PHASE_TIMER_FINISHED;
+    text_font_id: ttfid2
+    text: ${display_text_timer_finished}
+
+  - id: voice_assist_muted_phase_id
+    lambda: |-
+      return display::DisplayBuffer::PHASE_MUTED;
+    text_font_id: ttfid2
+    text: ${display_text_muted}
